@@ -8,7 +8,7 @@ first prepare data -
 
 now, train -
 
-python onebit_asr/train.py
+python -m onebit_asr.train
 
 
 ## BUGS and TODO - 

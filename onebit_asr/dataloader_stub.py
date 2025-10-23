@@ -24,9 +24,19 @@
 # --------------------------------------------------------------
 
 
-from typing import Dict
+from typing import Dict, Optional, Iterator, Any
 import torch
 from torch.utils.data import DataLoader, Dataset
+import os
+
+# Use the real dataset/dataloaders from src.data.dataset
+try:
+    from src.data.dataset import get_dataloaders
+    import sentencepiece as spm
+except Exception as e:
+    # Defer import errors until class construction to avoid breaking unrelated usages
+    get_dataloaders = None  # type: ignore
+    spm = None  # type: ignore
 
 class _DummyLibriSpeechDataset(Dataset):
     """A tiny synthetic dataset that returns fixed-shape dummy batches.
@@ -79,7 +89,7 @@ class _DummyLibriSpeechDataset(Dataset):
         }
 
 
-class LibriSpeechDataModule:
+class LibriSpeechDataModuleDummy:
     """Minimal dummy implementation
 
     This does not read any data from disk. It simply returns small, synthetic
@@ -143,10 +153,118 @@ class LibriSpeechDataModule:
     def special_ids(self) -> Dict[str, int]:
         return self._special_ids
 
+class LibriSpeechDataModule:
+    """DataModule that adapts src.data.dataset loaders to the expected training interface.
+
+    Exposes train_dataloader()/valid_dataloader() yielding batches with keys:
+      - 'feats': FloatTensor [B, T, F]
+      - 'feat_lens': LongTensor [B]
+      - 'tokens': LongTensor [B, U] (no BOS/EOS inside)
+      - 'token_lens': LongTensor [B]
+
+    Notes on vocabulary and special ids:
+      We reserve the first four ids for special tokens: pad=0, bos=1, eos=2, blank=3.
+      The SentencePiece vocabulary from the tokenizer is offset by +4 so that
+      true tokens occupy ids [4 .. 4+V_spm-1]. Padding remains 0.
+    """
+
+    def __init__(
+        self,
+        data_dir: str,
+        batch_size: int,
+        num_workers: int = 4,
+        tokenizer_path: Optional[str] = None,
+        cmvn_stats_path: Optional[str] = None,
+    ) -> None:
+        if get_dataloaders is None or spm is None:
+            raise ImportError(
+                "Failed to import dataset utilities or sentencepiece. Ensure dependencies are installed and src is on PYTHONPATH."
+            )
+
+        self._data_dir = data_dir
+        self._batch_size = batch_size
+        self._num_workers = num_workers
+
+        # Default artifact paths
+        self._tokenizer_path = tokenizer_path or os.path.join("src", "data", "tokenizer.model")
+        self._cmvn_stats_path = cmvn_stats_path or os.path.join("src", "data", "cmvn_stats.pt")
+
+        # Load tokenizer to determine base vocab size
+        self._sp = spm.SentencePieceProcessor()
+        if not os.path.exists(self._tokenizer_path):
+            raise FileNotFoundError(f"Tokenizer not found at: {self._tokenizer_path}")
+        self._sp.load(self._tokenizer_path)  # type: ignore[attr-defined]
+
+        # Reserve first 4 ids for specials and offset real tokens by +4
+        self._token_offset = 4
+        self._vocab_size = int(self._sp.get_piece_size()) + self._token_offset  # type: ignore[attr-defined]
+        self._special_ids = {
+            'pad_id': 0,
+            'bos_id': 1,
+            'eos_id': 2,
+            'blank_id': 3,
+        }
+
+        # Instantiate underlying dataloaders from the dataset module
+        # Note: src.data.dataset internally uses data located under ./data
+        # The passed data_dir is kept for API compatibility; datasets read from ./data
+        train_dl, val_dl, _test_dl = get_dataloaders(
+            tokenizer_path=self._tokenizer_path,
+            cmvn_stats_path=self._cmvn_stats_path,
+            batch_size=self._batch_size,
+            num_workers=self._num_workers,
+        )
+
+        # Wrap loaders to map keys and shift token ids
+        self._train_dl = _MappedLoader(train_dl, token_offset=self._token_offset)
+        self._valid_dl = _MappedLoader(val_dl, token_offset=self._token_offset)
+
+    def train_dataloader(self) -> Any:
+        return self._train_dl
+
+    def valid_dataloader(self) -> Any:
+        return self._valid_dl
+
+    def vocab_size(self) -> int:
+        return self._vocab_size
+
+    def special_ids(self) -> Dict[str, int]:
+        return self._special_ids
+
+
+class _MappedLoader:
+    """Thin wrapper that maps batch keys from src.data.dataset to training API.
+
+    Maps:
+      fbank -> feats
+      fbank_lengths -> feat_lens
+      labels (+offset, preserving pads) -> tokens
+      label_lengths -> token_lens
+    """
+
+    def __init__(self, base: DataLoader, token_offset: int) -> None:
+        self._base = base
+        self._token_offset = token_offset
+
+    def __iter__(self) -> Iterator[Dict[str, torch.Tensor]]:
+        for batch in self._base:
+            labels = batch['labels']
+            if self._token_offset:
+                # Preserve pads (0), shift only non-pad labels
+                labels = torch.where(labels != 0, labels + self._token_offset, labels)
+            yield {
+                'feats': batch['fbank'],
+                'feat_lens': batch['fbank_lengths'],
+                'tokens': labels,
+                'token_lens': batch['label_lengths'],
+            }
+
+    def __len__(self) -> int:
+        return len(self._base)
 
 if __name__ == "__main__":
 
-    dm = LibriSpeechDataModule(data_dir="data/hf_cache", batch_size=16, num_workers=4)
+    dm = LibriSpeechDataModule(data_dir="nothing", batch_size=16, num_workers=4)
     train_loader = dm.train_dataloader()
     valid_loader = dm.valid_dataloader()
 

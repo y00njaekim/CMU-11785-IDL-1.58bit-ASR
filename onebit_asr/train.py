@@ -114,10 +114,10 @@ def run_epoch(model: ConformerASR, dm, optimizer, sched, device, args, train: bo
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument('--data_dir', type=str, required=True)
+    p.add_argument('--data_dir', type=str, default="nothing")
     p.add_argument('--save_dir', type=str, default='./checkpoints')
     p.add_argument('--epochs', type=int, default=40)
-    p.add_argument('--batch_size', type=int, default=16)
+    p.add_argument('--batch_size', type=int, default=4)
     p.add_argument('--num_workers', type=int, default=4)
     p.add_argument('--lr', type=float, default=2e-3)
     p.add_argument('--warmup_steps', type=int, default=4000)

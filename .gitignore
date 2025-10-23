@@ -60,3 +60,4 @@ tensorboard/
 # Cache
 .cache/
 
+checkpoints/

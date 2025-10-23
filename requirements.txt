@@ -8,3 +8,4 @@ tqdm
 PyYAML
 librosa
 soundfile
+matplotlib

@@ -56,7 +56,6 @@ tensorboard/
 
 # Jupyter
 .ipynb_checkpoints/
-*.ipynb
 
 # Cache
 .cache/

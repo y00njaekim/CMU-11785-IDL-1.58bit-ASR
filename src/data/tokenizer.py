@@ -1,6 +1,6 @@
 import os
 import sentencepiece as spm
-from datasets import load_dataset, concatenate_datasets
+from datasets import load_from_disk, concatenate_datasets
 from tqdm import tqdm
 
 
@@ -26,13 +26,21 @@ def train_tokenizer(
         # Use all training splits as specified in the paper
         train_splits = ["train.clean.100", "train.clean.360", "train.other.500"]
     
-    print("Loading LibriSpeech training data...")
+    data_dir = "data"
+    print(f"Loading LibriSpeech training data from {data_dir}...")
     datasets = []
     for split in train_splits:
-        print(f"  Loading {split}...")
-        ds = load_dataset("librispeech_asr", "clean" if "clean" in split else "other", 
-                         split=split.replace(".", "-"), trust_remote_code=True)
+        dataset_path = os.path.join(data_dir, f"{split}_subset")
+        if not os.path.exists(dataset_path):
+            print(f"Warning: Dataset path not found: {dataset_path}. Skipping.")
+            continue
+        
+        print(f"  Loading {split} from {dataset_path}...")
+        ds = load_from_disk(dataset_path)
         datasets.append(ds)
+
+    if not datasets:
+        raise FileNotFoundError(f"No training datasets found in '{data_dir}'. Please check data paths.")
     
     # Concatenate all training datasets
     train_dataset = concatenate_datasets(datasets)

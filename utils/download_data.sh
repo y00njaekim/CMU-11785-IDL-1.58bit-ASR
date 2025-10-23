@@ -1,0 +1,1 @@
+python utils/download_data.py --subset 0.1 --cache-dir data

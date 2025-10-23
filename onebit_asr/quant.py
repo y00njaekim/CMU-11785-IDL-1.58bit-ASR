@@ -45,8 +45,10 @@ class _QuantizeSTE(torch.autograd.Function):
     def forward(ctx, W: torch.Tensor, alpha: torch.Tensor, bitwidth: int):
         # Alpha is scalar (tensor-wise). W_hat = alpha * Pi_Qn( clip(W/alpha, minQ, maxQ) )
         # For simplicity, clip range is [-1, 1] for both binary (Q1) and ternary (Q2).
+        
         Wa = W / alpha
         Wa_clipped = Wa.clamp(-1.0, 1.0)
+        
         if bitwidth == 1:  # binary {-1, +1}
             Q = Wa_clipped.sign()
             # map zeros to +1 (by convention). Avoid zeros by epsilon.
@@ -98,8 +100,16 @@ class QuantizedLinear(nn.Module):
     def __init__(self, in_features: int, out_features: int, bias: bool = True):
         super().__init__()
         self.weight = nn.Parameter(torch.empty(out_features, in_features))
+        
         nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
-        self.alpha = nn.Parameter(torch.tensor(1.0))  # learnable tensor-wise scale
+        
+        # Scale weights up by 2x for quantization-friendly range
+        # This puts most weights in range where |W/alpha| > 0.5 with alpha~0.1
+        with torch.no_grad():
+            self.weight.data *= 2.0
+        
+        self.alpha = nn.Parameter(torch.tensor(0.1))
+        
         if bias:
             self.bias = nn.Parameter(torch.zeros(out_features))
         else:
@@ -110,4 +120,6 @@ class QuantizedLinear(nn.Module):
             W_used = self.weight
         else:
             W_used = quantize_weight(self.weight, self.alpha.abs() + 1e-8, bitwidth)
-        return F.linear(x, W_used, self.bias)
+        
+        output = F.linear(x, W_used, self.bias)
+        return output

@@ -95,6 +95,7 @@ def run_epoch(model: ConformerASR, dm, optimizer, sched, device, args, train: bo
             Lkl_s = kl_logits(logitss, logits2.detach(), t_pad)
 
             loss = Lint2 + lambda1*(Lint1 + Lint_s) + lambda2*(Lkl1 + Lkl_s)
+            #loss = Lint2 + lambda1*(Lint1) + lambda2*(Lkl1)
 
         if train:
             optimizer.zero_grad()
@@ -113,13 +114,26 @@ def run_epoch(model: ConformerASR, dm, optimizer, sched, device, args, train: bo
 
 
 def main():
+    # ===== DEBUGPY SETUP FOR REMOTE DEBUGGING =====
+    # Uncomment the lines below to enable remote debugging
+    # Then connect VSCode debugger to port 5678
+    # SSH port forwarding: ssh -L 5678:localhost:5678 catalyst-0-9
+    
+    # import debugpy
+    # print("🐛 Waiting for debugger to attach on port 5678...")
+    # debugpy.listen(("0.0.0.0", 5678))
+    # debugpy.wait_for_client()
+    # print("✓ Debugger attached! Starting execution...")
+    # debugpy.breakpoint()  # This will pause execution here
+    # =============================================
+    
     p = argparse.ArgumentParser()
     p.add_argument('--data_dir', type=str, default="nothing")
     p.add_argument('--save_dir', type=str, default='./checkpoints')
     p.add_argument('--epochs', type=int, default=40)
     p.add_argument('--batch_size', type=int, default=4)
     p.add_argument('--num_workers', type=int, default=4)
-    p.add_argument('--lr', type=float, default=2e-3)
+    p.add_argument('--lr', type=float, default=5e-4) # Reduces lr
     p.add_argument('--warmup_steps', type=int, default=4000)
     p.add_argument('--input_dim', type=int, default=80)  # fbank dims
     p.add_argument('--enc_d_model', type=int, default=256)

@@ -31,13 +31,17 @@ class FeedForwardModule(nn.Module):
         self.lin1 = QuantizedLinear(d_model, d_ff)
         self.lin2 = QuantizedLinear(d_ff, d_model)
         self.dropout = nn.Dropout(dropout)
-    def forward(self, x, bitwidth: int):
+    def forward(self, x, bitwidth: int, mask=None):
         y = self.ln(x)
         y = self.lin1(y, bitwidth)
         y = swish(y)
         y = self.dropout(y)
         y = self.lin2(y, bitwidth)
         y = self.dropout(y)
+        # Zero out padded positions
+        if mask is not None:
+            seq_mask = mask[:, :, 0].unsqueeze(-1)  # [B, T, 1]
+            y = y * seq_mask
         return x + 0.5 * y  # macaron scaling 0.5
 
 
@@ -65,11 +69,18 @@ class MHSA(nn.Module):
         if mask is not None:
             attn_scores = attn_scores.masked_fill(mask[:, None, :, :]==0, float('-inf'))
         A = torch.softmax(attn_scores, dim=-1)
+        # Replace NaN with 0 (happens when all attention scores are -inf for padded positions)
+        A = torch.nan_to_num(A, nan=0.0)
         A = self.dropout(A)
         H = A @ V  # [B, h, T, d]
         H = H.transpose(1, 2).contiguous().view(B, T, C)
         H = self.out_proj(H, bitwidth)
         H = self.dropout(H)
+        # Zero out padded positions in H to prevent NaN propagation
+        if mask is not None:
+            # mask is [B, T, T], we need [B, T, 1] for the diagonal (self positions)
+            seq_mask = mask[:, :, 0].unsqueeze(-1)  # [B, T, 1]
+            H = H * seq_mask
         return x + H
 
 
@@ -80,10 +91,10 @@ class ConvModule(nn.Module):
         self.pw1 = nn.Conv1d(d_model, 2*d_model, kernel_size=1)
         self.glu = nn.GLU(dim=1)
         self.dw = nn.Conv1d(d_model, d_model, kernel_size=kernel_size, padding=kernel_size//2, groups=d_model)
-        self.bn = nn.BatchNorm1d(d_model)
+        self.bn = nn.BatchNorm1d(d_model, track_running_stats=False)
         self.pw2 = nn.Conv1d(d_model, d_model, kernel_size=1)
         self.dropout = nn.Dropout(dropout)
-    def forward(self, x):
+    def forward(self, x, mask=None):
         # x: [B, T, C]
         y = self.ln(x)
         y = y.transpose(1, 2)  # [B, C, T]
@@ -95,6 +106,10 @@ class ConvModule(nn.Module):
         y = self.pw2(y)
         y = self.dropout(y)
         y = y.transpose(1, 2)
+        # Zero out padded positions
+        if mask is not None:
+            seq_mask = mask[:, :, 0].unsqueeze(-1)  # [B, T, 1]
+            y = y * seq_mask
         return x + y
 
 
@@ -108,10 +123,10 @@ class ConformerBlock(nn.Module):
         self.conv = ConvModule(d_model, kernel_size=conv_kernel, dropout=dropout)
         self.ff2 = FeedForwardModule(d_model, d_ff, dropout)
     def forward(self, x, src_mask, bitwidth_linear: int):
-        x = self.ff1(x, bitwidth_linear)
+        x = self.ff1(x, bitwidth_linear, src_mask)
         x = self.mhsa(x, src_mask, bitwidth_linear)
-        x = self.conv(x)  # kept full-precision per paper recommendation
-        x = self.ff2(x, bitwidth_linear)
+        x = self.conv(x, src_mask)  # kept full-precision per paper recommendation
+        x = self.ff2(x, bitwidth_linear, src_mask)
         return x
 
 
@@ -129,11 +144,12 @@ class ConformerEncoder(nn.Module):
 
     def forward(self, feats: torch.Tensor, feat_lens: torch.Tensor,
                 precision: int, sp_mask: Optional[List[int]] = None):
-        # feats: [B, T, F]
         x = self.in_proj(feats)
         T = x.size(1)
-        x = x + self.pos_enc[:, :T, :]
-        # build src mask: [B, T] -> [B,T,T]
+        pos_enc_slice = self.pos_enc[:, :T, :]
+        x = x + pos_enc_slice
+        
+        # Build masks...
         B = x.size(0)
         device = x.device
         src_key_mask = torch.arange(T, device=device)[None, :].expand(B, T)
@@ -145,6 +161,7 @@ class ConformerEncoder(nn.Module):
             if sp_mask is not None:
                 bitw = 1 if sp_mask[i] == 1 else 2
             x = blk(x, attn_mask, bitw if bitw in (1, 2) else 32)
+        
         x = self.ln_out(x)
         return x, src_key_mask
 

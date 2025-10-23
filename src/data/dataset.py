@@ -6,7 +6,7 @@ import sentencepiece as spm
 import numpy as np
 from typing import Dict, List, Optional, Tuple
 from torch.utils.data import Dataset, DataLoader
-from datasets import load_dataset, concatenate_datasets
+from datasets import load_from_disk, concatenate_datasets, Audio
 from tqdm import tqdm
 
 
@@ -27,7 +27,6 @@ class LibriSpeechDataset(Dataset):
         split: str,
         tokenizer_path: str,
         cmvn_stats: Optional[Dict[str, torch.Tensor]] = None,
-        percentage: float = 1.0,
         apply_spec_augment: bool = False,
         spec_augment_config: Optional[Dict] = None,
     ):
@@ -38,14 +37,12 @@ class LibriSpeechDataset(Dataset):
             split: Dataset split ('train', 'validation', or 'test')
             tokenizer_path: Path to the trained SentencePiece model
             cmvn_stats: Dictionary containing 'mean' and 'std' for CMVN normalization
-            percentage: Percentage of data to use (0.0-1.0)
             apply_spec_augment: Whether to apply SpecAugment (only for training)
             spec_augment_config: Configuration for SpecAugment
         """
         self.split = split
         self.tokenizer_path = tokenizer_path
         self.cmvn_stats = cmvn_stats
-        self.percentage = percentage
         self.apply_spec_augment = apply_spec_augment
         
         self.tokenizer = spm.SentencePieceProcessor()
@@ -67,46 +64,37 @@ class LibriSpeechDataset(Dataset):
     
     def _load_dataset(self):
         """
-        Load and concatenate LibriSpeech dataset splits.
-        
-        If percentage < 1.0, only loads the required portion of data to save memory.
-        This is more efficient than loading all data and then selecting a subset.
+        Load and concatenate LibriSpeech dataset splits from local disk.
         """
         if self.split == 'train':
             splits = ["train.clean.100", "train.clean.360", "train.other.500"]
         elif self.split == 'validation':
-            splits = ["validation.clean", "validation.other"]
+            splits = ["dev.clean", "dev.other"]
         elif self.split == 'test':
             splits = ["test.clean", "test.other"]
         else:
             raise ValueError(f"Unknown split: {self.split}")
         
-        print(f"Loading {self.split} data...")
+        data_dir = "data"
+        print(f"Loading {self.split} data from {data_dir}...")
         datasets = []
         
-        if self.percentage < 1.0:
-            for split_name in splits:
-                print(f"  Loading {split_name}...")
-                config = "clean" if "clean" in split_name else "other"
-                hf_split = split_name.replace(".", "-")
-                
-                ds = load_dataset("librispeech_asr", config, split=hf_split, trust_remote_code=True)
-                
-                num_samples = int(len(ds) * self.percentage)
-                if num_samples > 0:
-                    ds = ds.select(range(num_samples))
-                    print(f"    Using {self.percentage*100}% of {split_name}: {num_samples} samples")
-                    datasets.append(ds)
-        else:
-            for split_name in splits:
-                print(f"  Loading {split_name}...")
-                config = "clean" if "clean" in split_name else "other"
-                hf_split = split_name.replace(".", "-")
-                
-                ds = load_dataset("librispeech_asr", config, split=hf_split, trust_remote_code=True)
-                print(f"    Loaded {len(ds)} samples")
-                datasets.append(ds)
+        for split_name in splits:
+            dataset_path = os.path.join(data_dir, f"{split_name}_subset")
+            if not os.path.exists(dataset_path):
+                print(f"Warning: Dataset path not found: {dataset_path}. Skipping.")
+                continue
+
+            print(f"  Loading {split_name} from {dataset_path}...")
+            ds = load_from_disk(dataset_path)
+            ds = ds.cast_column("audio", Audio(sampling_rate=16000))
+            
+            print(f"    Loaded {len(ds)} samples")
+            datasets.append(ds)
         
+        if not datasets:
+            raise FileNotFoundError(f"No datasets found for split '{self.split}' in '{data_dir}'. Please check data paths.")
+
         combined_dataset = concatenate_datasets(datasets)
         print(f"  Total samples after combining: {len(combined_dataset)}")
         
@@ -316,12 +304,11 @@ def compute_cmvn_stats(
     
     print("Computing CMVN statistics from training data...")
     
-    # Load a subset of training data
+    # Load training data
     train_dataset = LibriSpeechDataset(
         split='train',
         tokenizer_path=tokenizer_path,
         cmvn_stats=None,  # Don't apply normalization yet
-        percentage=min(1.0, num_samples / 281241),  # Total LibriSpeech train size
         apply_spec_augment=False,
     )
     
@@ -362,7 +349,6 @@ def get_dataloaders(
     tokenizer_path: str,
     cmvn_stats_path: str,
     batch_size: int = 16,
-    percentage: float = 1.0,
     num_workers: int = 4,
 ) -> Tuple[DataLoader, DataLoader, DataLoader]:
     """
@@ -374,7 +360,6 @@ def get_dataloaders(
         tokenizer_path: Path to the trained tokenizer model
         cmvn_stats_path: Path to precomputed CMVN statistics
         batch_size: Batch size for dataloaders
-        percentage: Percentage of data to use (for experimentation)
         num_workers: Number of worker processes for data loading
     
     Returns:
@@ -405,7 +390,6 @@ def get_dataloaders(
         split='train',
         tokenizer_path=tokenizer_path,
         cmvn_stats=cmvn_stats,
-        percentage=percentage,
         apply_spec_augment=True,  # Apply SpecAugment for training
     )
     
@@ -413,7 +397,6 @@ def get_dataloaders(
         split='validation',
         tokenizer_path=tokenizer_path,
         cmvn_stats=cmvn_stats,
-        percentage=percentage,
         apply_spec_augment=False,  # No augmentation for validation
     )
     
@@ -421,7 +404,6 @@ def get_dataloaders(
         split='test',
         tokenizer_path=tokenizer_path,
         cmvn_stats=cmvn_stats,
-        percentage=percentage,
         apply_spec_augment=False,  # No augmentation for testing
     )
     

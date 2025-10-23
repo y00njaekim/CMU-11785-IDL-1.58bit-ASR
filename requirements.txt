@@ -1,7 +1,10 @@
-torch
-torchaudio
-datasets
+torch==2.1.0
+torchaudio==2.1.0
+datasets==2.14.5
+numpy<2.0
+pyarrow==14.0.1
 sentencepiece
 tqdm
 PyYAML
-
+librosa
+soundfile

@@ -103,7 +103,6 @@ class QuantizedLinear(nn.Module):
         
         nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
         
-        # Scale weights up by 2x for quantization-friendly range
         # This puts most weights in range where |W/alpha| > 0.5 with alpha~0.1
         with torch.no_grad():
             self.weight.data *= 2.0

@@ -10,6 +10,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.optim.lr_scheduler import LambdaLR
+import socket, time
 
 from onebit_asr.conformer import ConformerASR
 from onebit_asr.losses import make_att_targets, att_ce_loss, ctc_loss_from_logits, kl_logits
@@ -150,7 +151,21 @@ def main():
     p.add_argument('--gamma_ctc', type=float, default=0.2)   # Eq. (1)
     p.add_argument('--lambda1', type=float, default=0.5)     # weight for 1-bit & SP losses
     p.add_argument('--lambda2', type=float, default=1.0)     # weight for KL terms
+    p.add_argument('--resume', action='store_true', help="resume wandb run")
     args = p.parse_args()
+
+    #----WandB Initialization----
+    run_id = f"{socket.gethostname()}-{int(time.time())}"
+    wandb.init(
+        project="ASR-1bit",
+        name=f"run-{run_id}",
+        group="baseline-conformer", # runs in the same experiment family are grouped for aligned comparison
+        config=vars(args),
+        tags=["baseline", "1bit", "cosine", "adamw"],   # used in WandB for filtering and comparing different experiments
+        resume="allow" if args.resume else None,
+        # notes="baseline training for 1bit",
+    )
+
 
     # --- You: implement this class in your project per the interface in README.
     from onebit_asr.dataloader_stub import LibriSpeechDataModule  # replace with your actual module
@@ -192,6 +207,12 @@ def main():
         va = run_epoch(model, dm, optimizer, sched=None, device=device, args=args, train=False,
                        lambda1=args.lambda1, lambda2=args.lambda2, gamma_ctc=args.gamma_ctc)
         print(f"Epoch {epoch}: train_loss={tr:.4f}  valid_loss={va:.4f}")
+        
+        wandb.log({
+            'epoch': epoch,
+            'train_loss': tr,
+            'valid_loss': va,
+        })
         ckpt = {
             'epoch': epoch,
             'model': model.state_dict(),

@@ -45,6 +45,37 @@ class FeedForwardModule(nn.Module):
         return x + 0.5 * y  # macaron scaling 0.5
 
 
+class RelPositionalEncoding(nn.Module):
+    def __init__(self, d_model: int, dropout_rate: float = 0.1, max_len: int = 5000):
+        super().__init__()
+        self.d_model = d_model
+        self.dropout = nn.Dropout(p=dropout_rate)
+        self.extend_pe(max_len)
+
+    def extend_pe(self, length):
+        if hasattr(self, 'pe') and self.pe is not None:
+            if self.pe.size(1) >= length:
+                return
+        
+        pe = torch.zeros(length, self.d_model)
+        position = torch.arange(0, length, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, self.d_model, 2, dtype=torch.float) * -(math.log(10000.0) / self.d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0)
+        
+        if hasattr(self, 'pe') and self.pe is not None:
+            pe = pe.to(self.pe.device)
+            self.pe = pe
+        else:
+            self.register_buffer('pe', pe)
+
+    def forward(self, x):
+        self.extend_pe(x.size(1))
+        pos_emb = self.pe[:, :x.size(1)]
+        return self.dropout(x), pos_emb
+
+
 class MHSA(nn.Module):
     def __init__(self, d_model: int, n_heads: int, dropout: float):
         super().__init__()
@@ -56,16 +87,39 @@ class MHSA(nn.Module):
         self.q_proj = QuantizedLinear(d_model, d_model)
         self.k_proj = QuantizedLinear(d_model, d_model)
         self.v_proj = QuantizedLinear(d_model, d_model)
+        self.pos_proj = QuantizedLinear(d_model, d_model)
         self.out_proj = QuantizedLinear(d_model, d_model)
         self.dropout = nn.Dropout(dropout)
+        
+        self.pos_bias_u = nn.Parameter(torch.randn(self.n_heads, self.d_head) * 0.01)
+        self.pos_bias_v = nn.Parameter(torch.randn(self.n_heads, self.d_head) * 0.01)
 
-    def forward(self, x, mask, bitwidth: int):
+    def rel_shift(self, x):
+        B, H, T1, T2 = x.shape
+        zero_pad = torch.zeros((B, H, T1, 1), device=x.device, dtype=x.dtype)
+        x_padded = torch.cat([zero_pad, x], dim=-1)
+        x_padded = x_padded.view(B, H, T2 + 1, T1)
+        x = x_padded[:, :, 1:].view_as(x)
+        return x
+
+    def forward(self, x, mask, bitwidth: int, pos_emb: torch.Tensor):
         B, T, C = x.shape
+        assert C == self.d_model, f"Expected {self.d_model}, got {C}"
+
         y = self.ln(x)
         Q = self.q_proj(y, bitwidth).view(B, T, self.n_heads, self.d_head).transpose(1, 2)
         K = self.k_proj(y, bitwidth).view(B, T, self.n_heads, self.d_head).transpose(1, 2)
         V = self.v_proj(y, bitwidth).view(B, T, self.n_heads, self.d_head).transpose(1, 2)
-        attn_scores = (Q @ K.transpose(-2, -1)) / math.sqrt(self.d_head)
+        p = self.pos_proj(pos_emb, bitwidth).view(1, T, self.n_heads, self.d_head).transpose(1, 2)
+
+        Q_with_u = Q + self.pos_bias_u.view(1, self.n_heads, 1, self.d_head)
+        Q_with_v = Q + self.pos_bias_v.view(1, self.n_heads, 1, self.d_head)
+
+        matrix_ac = torch.matmul(Q_with_u, K.transpose(-2, -1))
+        matrix_bd = torch.matmul(Q_with_v, p.transpose(-2, -1))
+        matrix_bd = self.rel_shift(matrix_bd)
+
+        attn_scores = (matrix_ac + matrix_bd) / math.sqrt(self.d_head)
         if mask is not None:
             attn_scores = attn_scores.masked_fill(mask[:, None, :, :]==0, float('-inf'))
         A = torch.softmax(attn_scores, dim=-1)
@@ -122,11 +176,13 @@ class ConformerBlock(nn.Module):
         self.mhsa = MHSA(d_model, n_heads, dropout)
         self.conv = ConvModule(d_model, kernel_size=conv_kernel, dropout=dropout)
         self.ff2 = FeedForwardModule(d_model, d_ff, dropout)
-    def forward(self, x, src_mask, bitwidth_linear: int):
-        x = self.ff1(x, bitwidth_linear, src_mask)
-        x = self.mhsa(x, src_mask, bitwidth_linear)
-        x = self.conv(x, src_mask)  # kept full-precision per paper recommendation
-        x = self.ff2(x, bitwidth_linear, src_mask)
+        self.ln = LayerNorm(d_model)
+    def forward(self, x, src_mask, bitwidth_linear: int, pos_emb: torch.Tensor):
+        x = self.ff1(x, bitwidth_linear)
+        x = self.mhsa(x, src_mask, bitwidth_linear, pos_emb)
+        x = self.conv(x)  # kept full-precision per paper recommendation
+        x = self.ff2(x, bitwidth_linear)
+        x = self.ln(x)
         return x
 
 
@@ -135,7 +191,7 @@ class ConformerEncoder(nn.Module):
                  d_ff: int, conv_kernel: int, dropout: float):
         super().__init__()
         self.in_proj = nn.Linear(input_dim, d_model)
-        self.pos_enc = nn.Parameter(torch.randn(1, 10000, d_model) * 0.01)
+        self.pos_enc = RelPositionalEncoding(d_model, dropout)
         self.blocks = nn.ModuleList([
             ConformerBlock(d_model, d_ff, n_heads, conv_kernel, dropout, i)
             for i in range(n_layers)
@@ -146,10 +202,8 @@ class ConformerEncoder(nn.Module):
                 precision: int, sp_mask: Optional[List[int]] = None):
         x = self.in_proj(feats)
         T = x.size(1)
-        pos_enc_slice = self.pos_enc[:, :T, :]
-        x = x + pos_enc_slice
-        
-        # Build masks...
+        x, pos_emb = self.pos_enc(x)
+        # build src mask: [B, T] -> [B,T,T]
         B = x.size(0)
         device = x.device
         src_key_mask = torch.arange(T, device=device)[None, :].expand(B, T)
@@ -160,8 +214,7 @@ class ConformerEncoder(nn.Module):
             bitw = precision
             if sp_mask is not None:
                 bitw = 1 if sp_mask[i] == 1 else 2
-            x = blk(x, attn_mask, bitw if bitw in (1, 2) else 32)
-        
+            x = blk(x, attn_mask, bitw if bitw in (1, 2) else 32, pos_emb)
         x = self.ln_out(x)
         return x, src_key_mask
 

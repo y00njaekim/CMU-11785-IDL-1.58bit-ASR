@@ -9,4 +9,5 @@ PyYAML
 librosa
 soundfile
 matplotlib
+wandb
 debugpy

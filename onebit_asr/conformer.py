@@ -167,6 +167,48 @@ class ConvModule(nn.Module):
         return x + y
 
 
+class Conv2dSubsampling(nn.Module):
+    """
+    2D convolutional subsampling (to ~1/4 time length), ESPnet/WeNet style.
+
+    Input:  x [B, T, F]  (e.g. log-Mel features)
+    Output: y [B, T', d_model], where T' ~ T // 4
+    """
+    def __init__(self, idim: int, d_model: int):
+        super().__init__()
+        self.d_model = d_model
+
+        # Two 3x3 convs with stride 2 (time and freq both downsampled)
+        self.conv = nn.Sequential(
+            nn.Conv2d(1, d_model, kernel_size=3, stride=2),  # (B,1,T,F) -> (B,d_model,T1,F1)
+            nn.ReLU(),
+            nn.Conv2d(d_model, d_model, kernel_size=3, stride=2),  # (B,d_model,T2,F2)
+            nn.ReLU(),
+        )
+
+        # Compute resulting frequency size after two convs (no padding, k=3,s=2)
+        # Matches ESPnet formula: (((idim - 1) // 2 - 1) // 2)
+        out_freq = (((idim - 1) // 2 - 1) // 2)
+        if out_freq <= 0:
+            raise ValueError(f"Input dim too small for Conv2dSubsampling: idim={idim}")
+
+        self.out = nn.Linear(d_model * out_freq, d_model)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [B, T, F]
+        B, T, F = x.shape
+        # Treat as image: [B, 1, T, F]
+        x = x.unsqueeze(1)
+        x = self.conv(x)                          # [B, C=d_model, T', F']
+        B, C, T_sub, F_sub = x.size()
+
+        # Move time to dim 1 and flatten (C * F')
+        x = x.transpose(1, 2).contiguous().view(B, T_sub, C * F_sub)  # [B, T', C*F']
+        x = self.out(x)                          # [B, T', d_model]
+        return x
+
+
+
 class ConformerBlock(nn.Module):
     def __init__(self, d_model: int, d_ff: int, n_heads: int, conv_kernel: int, dropout: float,
                  block_index: int):
@@ -190,7 +232,7 @@ class ConformerEncoder(nn.Module):
     def __init__(self, input_dim: int, d_model: int, n_layers: int, n_heads: int,
                  d_ff: int, conv_kernel: int, dropout: float):
         super().__init__()
-        self.in_proj = nn.Linear(input_dim, d_model)
+        self.subsample = Conv2dSubsampling(input_dim, d_model)
         self.pos_enc = RelPositionalEncoding(d_model, dropout)
         self.blocks = nn.ModuleList([
             ConformerBlock(d_model, d_ff, n_heads, conv_kernel, dropout, i)
@@ -200,23 +242,34 @@ class ConformerEncoder(nn.Module):
 
     def forward(self, feats: torch.Tensor, feat_lens: torch.Tensor,
                 precision: int, sp_mask: Optional[List[int]] = None):
-        x = self.in_proj(feats)
-        T = x.size(1)
-        x, pos_emb = self.pos_enc(x)
-        # build src mask: [B, T] -> [B,T,T]
-        B = x.size(0)
-        device = x.device
-        src_key_mask = torch.arange(T, device=device)[None, :].expand(B, T)
-        src_key_mask = (src_key_mask < feat_lens[:, None]).int()
-        attn_mask = src_key_mask[:, None, :] * src_key_mask[:, :, None]
+        # feats: [B, T, F]
+        B, T_in, F = feats.shape
+        device = feats.device
+        # 1) 2D conv subsampling: [B, T, F] -> [B, T_sub, d_model]
+        x = self.subsample(feats)
+        T_sub = x.size(1)
+
+        # Approximate new lengths (two stride-2 convs -> ~ /4)
+        enc_lens = feat_lens // 4
+
+        # 2) Relative positional encoding on subsampled sequence
+        x, pos_emb = self.pos_enc(x)  # pos_emb: [1, T_sub, d_model]
+
+        # 3) Build src mask: [B, T_sub]
+        t_idx = torch.arange(T_sub, device=device)[None, :].expand(B, T_sub)
+        src_key_mask = (t_idx < enc_lens[:, None])  # bool [B, T_sub]
+
+        # 4) Build attention mask [B, T_sub, T_sub] for encoder self-attn
+        attn_mask = src_key_mask[:, :, None] & src_key_mask[:, None, :]
 
         for i, blk in enumerate(self.blocks):
             bitw = precision
             if sp_mask is not None:
                 bitw = 1 if sp_mask[i] == 1 else 2
             x = blk(x, attn_mask, bitw if bitw in (1, 2) else 32, pos_emb)
+
         x = self.ln_out(x)
-        return x, src_key_mask
+        return x, src_key_mask  # src_key_mask now matches subsampled time
 
 
 class TransformerDecoder(nn.Module):

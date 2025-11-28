@@ -3,6 +3,7 @@
 # File: train.py
 # --------------------------------------------------------------
 import os
+import sys
 import math
 import argparse
 from typing import Optional, List
@@ -11,6 +12,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.optim.lr_scheduler import LambdaLR
 import socket, time
+import wandb
 
 from onebit_asr.conformer import ConformerASR
 from onebit_asr.losses import make_att_targets, att_ce_loss, ctc_loss_from_logits, kl_logits
@@ -74,14 +76,16 @@ def run_epoch(model: ConformerASR, dm, optimizer, sched, device, args, train: bo
             t_inp, t_out, t_pad = make_att_targets(batch['tokens'], bos_id, eos_id, pad_id)
             logits2 = model.decode_logits(enc2, mask2, t_inp, t_pad)
             Latt2 = att_ce_loss(logits2, t_out, pad_id, label_smoothing=0.1)
-            Lctc2 = ctc_loss_from_logits(ctc2, batch['feat_lens'], batch['tokens'], batch['token_lens'], blank_id)
+            ctc_lens2 = mask2.sum(dim=1).long()
+            Lctc2 = ctc_loss_from_logits(ctc2, ctc_lens2, batch['tokens'], batch['token_lens'], blank_id)
             Lint2 = (1-gamma_ctc)*Latt2 + gamma_ctc*Lctc2
 
             # ---------- Student: 1‑bit ----------
             enc1, mask1, ctc1 = model(batch, precision=1)
             logits1 = model.decode_logits(enc1, mask1, t_inp, t_pad)
             Latt1 = att_ce_loss(logits1, t_out, pad_id, label_smoothing=0.1)
-            Lctc1 = ctc_loss_from_logits(ctc1, batch['feat_lens'], batch['tokens'], batch['token_lens'], blank_id)
+            ctc_lens1 = mask1.sum(dim=1).long()
+            Lctc1 = ctc_loss_from_logits(ctc1, ctc_lens1, batch['tokens'], batch['token_lens'], blank_id)
             Lint1 = (1-gamma_ctc)*Latt1 + gamma_ctc*Lctc1
             # KL from 2->1
             Lkl1 = kl_logits(logits1, logits2.detach(), t_pad)
@@ -91,7 +95,8 @@ def run_epoch(model: ConformerASR, dm, optimizer, sched, device, args, train: bo
             encs, masks, ctcs = model(batch, precision=2, sp_mask=sp_mask)
             logitss = model.decode_logits(encs, masks, t_inp, t_pad)
             Latt_s = att_ce_loss(logitss, t_out, pad_id, label_smoothing=0.1)
-            Lctc_s = ctc_loss_from_logits(ctcs, batch['feat_lens'], batch['tokens'], batch['token_lens'], blank_id)
+            ctc_lens_s = masks.sum(dim=1).long()
+            Lctc_s = ctc_loss_from_logits(ctcs, ctc_lens_s, batch['tokens'], batch['token_lens'], blank_id)
             Lint_s = (1-gamma_ctc)*Latt_s + gamma_ctc*Lctc_s
             Lkl_s = kl_logits(logitss, logits2.detach(), t_pad)
 
@@ -155,6 +160,15 @@ def main():
     args = p.parse_args()
 
     #----WandB Initialization----
+    api_key_file = "wandb_api_key.txt"
+    if not os.path.exists(api_key_file):
+        print(f"Error: WandB API key file '{api_key_file}' not found.")
+        sys.exit(1)
+    
+    with open(api_key_file, "r") as f:
+        api_key = f.read().strip()
+    wandb.login(key=api_key)
+
     run_id = f"{socket.gethostname()}-{int(time.time())}"
     wandb.init(
         project="ASR-1bit",

@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .quant import QuantizedLinear
+from quant import QuantizedLinear
 
 
 def swish(x):
@@ -320,3 +320,48 @@ class ConformerASR(nn.Module):
 
     def decode_logits(self, enc_out, enc_mask, tgt_inp, tgt_pad_mask):
         return self.decoder(tgt_inp, enc_out, enc_mask, tgt_pad_mask)
+
+
+def test_conformer():
+    # Use the same architecture numbers as defaults in train.py
+    input_dim = 256
+    vocab_size = 100
+    # ConformerASR defaults already match train.py; instantiate with defaults
+    model = ConformerASR(input_dim, vocab_size)
+
+    # Dummy input batch
+    B = 4
+    T = 1000
+    F = input_dim
+    feats = torch.randn(B, T, F)
+    feat_lens = torch.tensor([500, 500, 500, 500])
+
+    batch = {
+        'feats': feats,
+        'feat_lens': feat_lens
+    }
+
+    # Minimal torchinfo summary (no wrappers/fallbacks)
+    from torchinfo import summary  # requires: pip install torchinfo
+    print("\nModel summary (torchinfo):")
+    summary(
+        model,
+        input_data=({'feats': feats, 'feat_lens': feat_lens}, 32),
+        col_names=("input_size", "output_size", "num_params", "kernel_size", "mult_adds"),
+        depth=4,
+        device="cpu",
+    )
+
+    print("\nRunning forward pass...")
+    try:
+        enc_out, enc_mask, logits = model(batch, precision=32)
+        print("Forward pass successful!")
+        print("Enc out shape:", enc_out.shape)
+        print("Logits shape:", logits.shape)
+    except Exception as e:
+        print("Forward pass failed!")
+        print(e)
+        raise e
+
+if __name__ == "__main__":
+    test_conformer()

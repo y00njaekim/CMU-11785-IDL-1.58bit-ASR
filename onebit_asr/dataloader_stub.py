@@ -34,6 +34,7 @@ try:
     from src.data.dataset import get_dataloaders
     import sentencepiece as spm
 except Exception as e:
+    raise e
     # Defer import errors until class construction to avoid breaking unrelated usages
     get_dataloaders = None  # type: ignore
     spm = None  # type: ignore

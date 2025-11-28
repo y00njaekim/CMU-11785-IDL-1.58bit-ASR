@@ -62,3 +62,7 @@ tensorboard/
 
 checkpoints/
 data/
+wandb/
+
+# WandB API Key
+wandb_api_key.txt

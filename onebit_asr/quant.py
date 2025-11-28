@@ -107,8 +107,11 @@ class QuantizedLinear(nn.Module):
         with torch.no_grad():
             self.weight.data *= 2.0
         
-        self.alpha = nn.Parameter(torch.tensor(0.1))
-        
+        # A more data-driven alpha init
+        with torch.no_grad():
+            alpha_init = self.weight.abs().mean()  # or .max()
+        self.alpha = nn.Parameter(alpha_init)
+
         if bias:
             self.bias = nn.Parameter(torch.zeros(out_features))
         else:

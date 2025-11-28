@@ -1,5 +1,6 @@
 import os
 import sys
+import json
 import torch
 import argparse
 import math
@@ -13,52 +14,12 @@ import torchaudio
 sys.path.append(os.getcwd())
 
 from onebit_asr.conformer import ConformerASR
+from onebit_asr.metrics import (
+    compute_wer,
+    ctc_beam_search_batch,
+    ids_to_text,
+)
 from src.data.dataset import LibriSpeechDataset, CollateFunction
-
-def levenshtein_distance(ref, hyp):
-    """
-    Compute Levenshtein distance between two sequences of words.
-    """
-    m = len(ref)
-    n = len(hyp)
-    
-    # Create a matrix to store results of subproblems
-    dp = [[0] * (n + 1) for _ in range(m + 1)]
-    
-    # Initialize first row and column
-    for i in range(m + 1):
-        dp[i][0] = i
-    for j in range(n + 1):
-        dp[0][j] = j
-        
-    # Fill dp matrix
-    for i in range(1, m + 1):
-        for j in range(1, n + 1):
-            if ref[i - 1] == hyp[j - 1]:
-                dp[i][j] = dp[i - 1][j - 1]
-            else:
-                dp[i][j] = 1 + min(dp[i - 1][j],    # Deletion
-                                   dp[i][j - 1],    # Insertion
-                                   dp[i - 1][j - 1]) # Substitution
-    return dp[m][n]
-
-def compute_wer(refs, hyps):
-    """
-    Compute WER for a batch of references and hypotheses.
-    refs: list of reference strings
-    hyps: list of hypothesis strings
-    """
-    total_dist = 0
-    total_words = 0
-    
-    for r, h in zip(refs, hyps):
-        r_words = r.split()
-        h_words = h.split()
-        dist = levenshtein_distance(r_words, h_words)
-        total_dist += dist
-        total_words += len(r_words)
-        
-    return total_dist, total_words
 
 class CustomLibriSpeechDataset(LibriSpeechDataset):
     def __init__(self, splits, *args, **kwargs):
@@ -87,28 +48,18 @@ class CustomLibriSpeechDataset(LibriSpeechDataset):
              raise FileNotFoundError(f"No datasets found for splits {self.target_splits}")
         return concatenate_datasets(datasets)
 
-def decode_greedy(logits, vocab_size, blank_id=3):
-    """
-    Greedy decoding of CTC logits.
-    logits: [B, T, V]
-    Returns: list of token ID lists
-    """
-    preds = torch.argmax(logits, dim=-1) # [B, T]
-    decoded = []
-    for i in range(preds.size(0)):
-        pred = preds[i]
-        # Collapse repeats and remove blanks
-        t = pred[0].item()
-        tokens = []
-        if t != blank_id:
-            tokens.append(t)
-        
-        for j in range(1, len(pred)):
-            t_curr = pred[j].item()
-            if t_curr != blank_id and t_curr != pred[j-1].item():
-                tokens.append(t_curr)
-        decoded.append(tokens)
-    return decoded
+def _maybe_load_config_from_checkpoint(checkpoint_path: str) -> dict:
+    """If `checkpoint_path` is inside a run dir, try to load config.json there."""
+    try:
+        run_dir = checkpoint_path if os.path.isdir(checkpoint_path) else os.path.dirname(checkpoint_path)
+        cfg_path = os.path.join(run_dir, 'config.json')
+        if os.path.exists(cfg_path):
+            print(f"Found model config.json")
+            with open(cfg_path, 'r') as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {}
 
 def evaluate_split(model, split_name, args, tokenizer, cmvn_stats, device):
     print(f"\nEvaluating on {split_name}...")
@@ -129,8 +80,12 @@ def evaluate_split(model, split_name, args, tokenizer, cmvn_stats, device):
         collate_fn=collate_fn
     )
     
-    total_dist = 0
     total_words = 0
+    totals = {
+        'wer_fp32': 0,
+        'wer_2bit': 0,
+        'wer_1bit': 0,
+    }
     
     model.eval()
     with torch.no_grad():
@@ -159,15 +114,22 @@ def evaluate_split(model, split_name, args, tokenizer, cmvn_stats, device):
             # But the quantized layers might expect specific bitwidths.
             # Let's try 32 first.
             
-            enc_out, enc_mask, logits_ctc = model(batch_input, precision=32)
-            
-            # Decode
-            # blank_id is 3 based on dataloader_stub.py and dataset.py
-            decoded_ids = decode_greedy(logits_ctc, model.ctc_head.out_features, blank_id=3)
+            # Run three precisions: 32, 2, 1
+            enc_fp, mask_fp, ctc_fp = model(batch_input, precision=32)
+            enc_t2, mask_t2, ctc_t2 = model(batch_input, precision=2)
+            enc_s1, mask_s1, ctc_s1 = model(batch_input, precision=1)
+
+            valid_fp = mask_fp.sum(dim=1).long()
+            valid_t2 = mask_t2.sum(dim=1).long()
+            valid_s1 = mask_s1.sum(dim=1).long()
+
+            hyp_fp = ctc_beam_search_batch(ctc_fp, valid_fp, beam_size=args.beam_size, blank_id=3)
+            hyp_t2 = ctc_beam_search_batch(ctc_t2, valid_t2, beam_size=args.beam_size, blank_id=3)
+            hyp_s1 = ctc_beam_search_batch(ctc_s1, valid_s1, beam_size=args.beam_size, blank_id=3)
             
             # Convert IDs to text
-            hyp_texts = []
-            for ids in decoded_ids:
+            hyp_texts_fp = []
+            for ids in hyp_fp:
                 # Filter out special tokens if any (0,1,2 are pad, bos, eos)
                 # The tokenizer might handle them, but usually we just decode.
                 # The dataset offsets tokens by 4. We need to subtract 4?
@@ -185,7 +147,19 @@ def evaluate_split(model, split_name, args, tokenizer, cmvn_stats, device):
                 
                 valid_ids = [i - 4 for i in ids if i >= 4]
                 text = tokenizer.decode(valid_ids)
-                hyp_texts.append(text)
+                hyp_texts_fp.append(text)
+
+            hyp_texts_t2 = []
+            for ids in hyp_t2:
+                valid_ids = [i - 4 for i in ids if i >= 4]
+                text = tokenizer.decode(valid_ids)
+                hyp_texts_t2.append(text)
+
+            hyp_texts_s1 = []
+            for ids in hyp_s1:
+                valid_ids = [i - 4 for i in ids if i >= 4]
+                text = tokenizer.decode(valid_ids)
+                hyp_texts_s1.append(text)
                 
             # Get reference text
             ref_texts = []
@@ -208,16 +182,29 @@ def evaluate_split(model, split_name, args, tokenizer, cmvn_stats, device):
             
             if total_words < 100: # Print first few examples
                 print(f"\nRef: {ref_texts[0]}")
-                print(f"Hyp: {hyp_texts[0]}")
-                print(f"Pred IDs: {decoded_ids[0]}")
-            
-            d, w = compute_wer(ref_texts, hyp_texts)
-            total_dist += d
+                print(f"Hyp(fp32): {hyp_texts_fp[0]}")
+                print(f"Hyp(2bit): {hyp_texts_t2[0]}")
+                print(f"Hyp(1bit): {hyp_texts_s1[0]}")
+
+            d_fp, w = compute_wer(ref_texts, hyp_texts_fp)
+            d_t2, _ = compute_wer(ref_texts, hyp_texts_t2)
+            d_s1, _ = compute_wer(ref_texts, hyp_texts_s1)
+            totals['wer_fp32'] += d_fp
+            totals['wer_2bit'] += d_t2
+            totals['wer_1bit'] += d_s1
             total_words += w
             
-    wer = total_dist / total_words if total_words > 0 else 0.0
-    print(f"WER on {split_name}: {wer:.4f} ({total_dist}/{total_words})")
-    return wer
+    wer_fp = totals['wer_fp32'] / total_words if total_words > 0 else 0.0
+    wer_t2 = totals['wer_2bit'] / total_words if total_words > 0 else 0.0
+    wer_s1 = totals['wer_1bit'] / total_words if total_words > 0 else 0.0
+    print(f"WER on {split_name} (fp32): {wer_fp:.4f} ({totals['wer_fp32']}/{total_words})")
+    print(f"WER on {split_name} (2-bit): {wer_t2:.4f} ({totals['wer_2bit']}/{total_words})")
+    print(f"WER on {split_name} (1-bit): {wer_s1:.4f} ({totals['wer_1bit']}/{total_words})")
+    return {
+        'fp32': wer_fp,
+        '2bit': wer_t2,
+        '1bit': wer_s1,
+    }
 
 def main():
     parser = argparse.ArgumentParser()
@@ -226,6 +213,7 @@ def main():
     parser.add_argument('--num_workers', type=int, default=4)
     parser.add_argument('--tokenizer_path', type=str, default='src/data/tokenizer.model')
     parser.add_argument('--cmvn_stats_path', type=str, default='src/data/cmvn_stats.pt')
+    parser.add_argument('--beam_size', type=int, default=10)
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
     args = parser.parse_args()
     
@@ -234,8 +222,24 @@ def main():
         print(f"Error: Checkpoint {args.checkpoint} not found.")
         return
 
+    # Load optional config.json from run directory to override defaults
+    cfg_json = _maybe_load_config_from_checkpoint(args.checkpoint)
+
     checkpoint = torch.load(args.checkpoint, map_location=args.device)
-    train_args = checkpoint['args']
+    train_args = checkpoint.get('args', {})
+
+    # Prefer config file overrides if present
+    if isinstance(cfg_json, dict) and cfg_json:
+        # tokenizer/cmvn
+        args.tokenizer_path = cfg_json.get('tokenizer_path', args.tokenizer_path)
+        args.cmvn_stats_path = cfg_json.get('cmvn_stats_path', args.cmvn_stats_path)
+        # model hyperparams
+        for k in [
+            'input_dim','enc_d_model','enc_layers','enc_heads','enc_d_ff','enc_conv_kernel','dropout',
+            'dec_layers','dec_heads','dec_d_ff'
+        ]:
+            if k in cfg_json:
+                train_args[k] = cfg_json[k]
     
     # Load tokenizer
     if not os.path.exists(args.tokenizer_path):
@@ -283,8 +287,8 @@ def main():
     wer_other = evaluate_split(model, "test.other", args, sp, cmvn_stats, device)
     
     print("\nSummary:")
-    print(f"Test Clean WER: {wer_clean:.4f}")
-    print(f"Test Other WER: {wer_other:.4f}")
+    print(f"Test Clean WERs: fp32={wer_clean['fp32']:.4f}, 2bit={wer_clean['2bit']:.4f}, 1bit={wer_clean['1bit']:.4f}")
+    print(f"Test Other WERs: fp32={wer_other['fp32']:.4f}, 2bit={wer_other['2bit']:.4f}, 1bit={wer_other['1bit']:.4f}")
 
 if __name__ == '__main__':
     main()

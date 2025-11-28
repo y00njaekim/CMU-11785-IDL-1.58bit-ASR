@@ -8,6 +8,7 @@ from typing import List, Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 from quant import QuantizedLinear
 
@@ -230,7 +231,7 @@ class ConformerBlock(nn.Module):
 
 class ConformerEncoder(nn.Module):
     def __init__(self, input_dim: int, d_model: int, n_layers: int, n_heads: int,
-                 d_ff: int, conv_kernel: int, dropout: float):
+                 d_ff: int, conv_kernel: int, dropout: float, use_checkpoint: bool = True):
         super().__init__()
         self.subsample = Conv2dSubsampling(input_dim, d_model)
         self.pos_enc = RelPositionalEncoding(d_model, dropout)
@@ -304,10 +305,10 @@ class ConformerASR(nn.Module):
                  enc_d_model=256, enc_layers=12, enc_heads=4, enc_d_ff=1024,
                  enc_conv_kernel=31, enc_dropout=0.1,
                  dec_layers=2, dec_heads=4, dec_d_ff=1024, dec_dropout=0.1,
-                 pad_id=0):
+                 pad_id=0, use_checkpoint=True):
         super().__init__()
         self.encoder = ConformerEncoder(input_dim, enc_d_model, enc_layers, enc_heads,
-                                        enc_d_ff, enc_conv_kernel, enc_dropout)
+                                        enc_d_ff, enc_conv_kernel, enc_dropout, use_checkpoint=use_checkpoint)
         self.decoder = TransformerDecoder(vocab_size, enc_d_model, dec_layers, dec_heads,
                                           dec_d_ff, dec_dropout, pad_id)
         self.ctc_head = nn.Linear(enc_d_model, vocab_size)

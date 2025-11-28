@@ -12,8 +12,10 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.optim.lr_scheduler import LambdaLR
+from torch.utils.data import Subset
 import socket, time
 import wandb
+from dotenv import load_dotenv
 
 from onebit_asr.conformer import ConformerASR
 from onebit_asr.losses import make_att_targets, att_ce_loss, ctc_loss_from_logits, kl_logits
@@ -97,6 +99,12 @@ def run_epoch(model: ConformerASR, dm, optimizer, sched, device, args, train: bo
             Lint1 = (1-gamma_ctc)*Latt1 + gamma_ctc*Lctc1
             # KL from 2->1
             Lkl1 = kl_logits(logits1, logits2.detach(), t_pad)
+
+            # Clear intermediate activations to free memory (keep logits2 for KL loss)
+            if train:
+                del enc2, mask2, ctc2, enc1, mask1, ctc1
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
             # ---------- Stochastic Precision sub‑model ----------
             sp_mask = sample_sp_mask(n_layers=args.enc_layers)
@@ -186,8 +194,8 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument('--data_dir', type=str, default="nothing")
     p.add_argument('--save_dir', type=str, default='./checkpoints')
-    p.add_argument('--epochs', type=int, default=40)
-    p.add_argument('--batch_size', type=int, default=4)
+    p.add_argument('--epochs', type=int, default=10)
+    p.add_argument('--batch_size', type=int, default=2)
     p.add_argument('--num_workers', type=int, default=4)
     p.add_argument('--lr', type=float, default=5e-4) # Reduces lr
     p.add_argument('--warmup_steps', type=int, default=4000)
@@ -207,34 +215,76 @@ def main():
     p.add_argument('--gamma_ctc', type=float, default=0.2)   # Eq. (1)
     p.add_argument('--lambda1', type=float, default=0.5)     # weight for 1-bit & SP losses
     p.add_argument('--lambda2', type=float, default=1.0)     # weight for KL terms
+    p.add_argument('--train_data_fraction', type=float, default=0.5, help="Fraction of training data to use (0.0-1.0, default: 0.1 for 10%%)")
     p.add_argument('--resume', action='store_true', help="resume wandb run")
+    p.add_argument('--use_checkpoint', action='store_true', default=True, help="Use gradient checkpointing to save memory")
+    p.add_argument('--no_checkpoint', dest='use_checkpoint', action='store_false', help="Disable gradient checkpointing")
     args = p.parse_args()
 
     #----WandB Initialization----
-    api_key_file = "wandb_api_key.txt"
-    if not os.path.exists(api_key_file):
-        print(f"Error: WandB API key file '{api_key_file}' not found.")
-        sys.exit(1)
+    # Load environment variables from .env file
+    load_dotenv()
     
-    with open(api_key_file, "r") as f:
-        api_key = f.read().strip()
-    wandb.login(key=api_key)
-
+    # Login to wandb with API key from .env file or environment variable
+    wandb_api_key = os.getenv('WANDB_API_KEY')
+    if wandb_api_key:
+        wandb.login(key=wandb_api_key)
+    else:
+        print("Warning: WANDB_API_KEY not found in .env file or environment. WandB may not work properly.")
+        print("Create a .env file with: WANDB_API_KEY='your-api-key'")
+        print("Or set it with: export WANDB_API_KEY='your-api-key'")
+    
+    # Create descriptive run name based on training data fraction
+    data_pct = int(args.train_data_fraction * 100)
     run_id = f"{socket.gethostname()}-{int(time.time())}"
+    run_name = f"run-{data_pct}pct-{run_id}" if args.train_data_fraction < 1.0 else f"run-{run_id}"
+    
     wandb.init(
         project="ASR-1bit",
-        name=f"run-{run_id}",
-        group="baseline-conformer", # runs in the same experiment family are grouped for aligned comparison
+        name=run_name,
+        group=f"baseline-conformer-{data_pct}pct" if args.train_data_fraction < 1.0 else "baseline-conformer",
         config=vars(args),
-        tags=["baseline", "1bit", "cosine", "adamw"],   # used in WandB for filtering and comparing different experiments
+        tags=["baseline", "1bit", "cosine", "adamw", f"{data_pct}pct"] if args.train_data_fraction < 1.0 else ["baseline", "1bit", "cosine", "adamw"],
         resume="allow" if args.resume else None,
-        # notes="baseline training for 1bit",
+        # notes=f"baseline training for 1bit with {data_pct}% of training data",
     )
 
 
     # --- You: implement this class in your project per the interface in README.
     from onebit_asr.dataloader_stub import LibriSpeechDataModule  # replace with your actual module
     dm = LibriSpeechDataModule(args.data_dir, batch_size=args.batch_size, num_workers=args.num_workers)
+
+    # Create subset of training data if train_data_fraction < 1.0
+    if args.train_data_fraction < 1.0:
+        train_dl = dm.train_dataloader()
+        # Get the base dataloader to access the dataset
+        base_dataloader = train_dl._base
+        base_dataset = base_dataloader.dataset
+        total_samples = len(base_dataset)
+        subset_size = int(total_samples * args.train_data_fraction)
+        
+        # Create random indices for subset (use fixed seed for reproducibility, or random for variety)
+        generator = torch.Generator().manual_seed(42)  # Fixed seed for reproducibility
+        indices = torch.randperm(total_samples, generator=generator)[:subset_size].tolist()
+        subset_dataset = Subset(base_dataset, indices)
+        
+        # Create new dataloader with subset, using same collate function
+        from torch.utils.data import DataLoader
+        subset_dl = DataLoader(
+            subset_dataset,
+            batch_size=args.batch_size,
+            shuffle=True,
+            num_workers=args.num_workers,
+            collate_fn=base_dataloader.collate_fn,
+            pin_memory=base_dataloader.pin_memory if hasattr(base_dataloader, 'pin_memory') else True,
+        )
+        
+        # Wrap in _MappedLoader to maintain interface
+        from onebit_asr.dataloader_stub import _MappedLoader
+        token_offset = train_dl._token_offset
+        dm._train_dl = _MappedLoader(subset_dl, token_offset=token_offset)
+        
+        print(f"Using {subset_size}/{total_samples} training samples ({args.train_data_fraction*100:.1f}%)")
 
     vocab = dm.vocab_size()
     special = dm.special_ids()
@@ -254,6 +304,7 @@ def main():
         dec_d_ff=args.dec_d_ff,
         dec_dropout=args.dropout,
         pad_id=special['pad_id'],
+        use_checkpoint=args.use_checkpoint,
     ).to(device)
 
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.98), weight_decay=1e-2)

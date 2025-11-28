@@ -8,11 +8,20 @@ first prepare data -
 
 now, train -
 
-python -m onebit_asr.train
+1. Set up WandB API key (required for logging):
+   - Create a `.env` file in the project root with:
+     ```
+     WANDB_API_KEY=your-wandb-api-key-here
+     ```
+   - Get your API key from: https://wandb.ai/authorize
+   - The `.env` file is already in `.gitignore`, so it won't be committed
+
+2. Run training:
+   ```bash
+   python -m onebit_asr.train
+   ```
 
 
 ## BUGS and TODO - 
 
-1. training only supports v small batch size (less than 8). this is a bug in either dataloader or conformer implementation
-
-2. loss/gradients go to NaNs after a while
+1. training only supports v small batch size (less than 8).

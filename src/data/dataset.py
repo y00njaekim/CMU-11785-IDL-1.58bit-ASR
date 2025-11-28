@@ -1,9 +1,11 @@
 import os
 import json
+import io
 import torch
 import torchaudio
 import sentencepiece as spm
 import numpy as np
+import soundfile as sf
 from typing import Dict, List, Optional, Tuple
 from torch.utils.data import Dataset, DataLoader
 from datasets import load_from_disk, concatenate_datasets, Audio
@@ -87,7 +89,8 @@ class LibriSpeechDataset(Dataset):
 
             print(f"  Loading {split_name} from {dataset_path}...")
             ds = load_from_disk(dataset_path)
-            ds = ds.cast_column("audio", Audio(sampling_rate=16000))
+            # Use decode=False to avoid torchcodec dependency, we'll decode manually with soundfile
+            ds = ds.cast_column("audio", Audio(decode=False, sampling_rate=16000))
             
             print(f"    Loaded {len(ds)} samples")
             datasets.append(ds)
@@ -114,9 +117,46 @@ class LibriSpeechDataset(Dataset):
         """
         item = self.dataset[idx]
         
-        waveform = torch.FloatTensor(item['audio']['array']).unsqueeze(0)
-        sample_rate = item['audio']['sampling_rate']
+        # Decode audio manually using soundfile to avoid torchcodec dependency
+        audio_data = item['audio']
         
+        if isinstance(audio_data, dict):
+            if 'bytes' in audio_data and audio_data['bytes']:
+                # Audio is stored as bytes in Arrow format, decode it
+                audio_bytes = audio_data['bytes']
+                waveform, sample_rate = sf.read(io.BytesIO(audio_bytes))
+                waveform = torch.FloatTensor(waveform)
+            elif 'path' in audio_data and audio_data['path']:
+                # Try to read from path if it's an absolute path
+                audio_path = audio_data['path']
+                if os.path.isabs(audio_path) and os.path.exists(audio_path):
+                    waveform, sample_rate = sf.read(audio_path)
+                    waveform = torch.FloatTensor(waveform)
+                else:
+                    # Path is relative or doesn't exist, try bytes or fall back to torchaudio
+                    if 'bytes' in audio_data and audio_data['bytes']:
+                        audio_bytes = audio_data['bytes']
+                        waveform, sample_rate = sf.read(io.BytesIO(audio_bytes))
+                        waveform = torch.FloatTensor(waveform)
+                    else:
+                        raise ValueError(f"Audio path '{audio_path}' doesn't exist and no bytes available")
+            elif 'array' in audio_data:
+                # Already decoded (shouldn't happen with decode=False, but handle it)
+                waveform = torch.FloatTensor(audio_data['array'])
+                sample_rate = audio_data.get('sampling_rate', 16000)
+            else:
+                raise ValueError(f"Audio data format not recognized: {list(audio_data.keys())}")
+        else:
+            raise ValueError(f"Audio data is not a dict: {type(audio_data)}")
+        
+        # Ensure waveform is 1D, then add channel dimension
+        if waveform.dim() == 1:
+            waveform = waveform.unsqueeze(0)
+        elif waveform.dim() == 2:
+            # If stereo, take first channel
+            waveform = waveform[0:1]
+        
+        # Resample if needed
         if sample_rate != 16000:
             resampler = torchaudio.transforms.Resample(sample_rate, 16000)
             waveform = resampler(waveform)

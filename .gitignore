@@ -66,3 +66,7 @@ wandb/
 
 # WandB API Key
 wandb_api_key.txt
+
+# Environment variables
+.env
+.env.local

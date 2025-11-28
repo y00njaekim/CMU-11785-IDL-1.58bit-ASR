@@ -344,6 +344,102 @@ def compute_cmvn_stats(
     
     return cmvn_stats
 
+    
+from torch.utils.data import Sampler
+from typing import List
+
+# length_sampler.py
+
+import math
+import random
+from typing import List, Iterator, Sequence
+from torch.utils.data import Sampler
+
+
+class LengthAwareBatchSampler(Sampler[List[int]]):
+    """
+    Batch sampler that groups examples of similar length, then shuffles
+    the resulting batches each epoch.
+
+    - Uses per-example lengths (e.g., fbank_length) to sort indices.
+    - Forms contiguous batches in that sorted order -> length-homogeneous.
+    - Shuffles the list of batches every epoch (and optionally shuffles
+      the order of samples within each batch).
+
+    This gives:
+      * good padding efficiency
+      * still-randomized training order (at the batch level)
+    """
+
+    def __init__(
+        self,
+        lengths: Sequence[int],
+        batch_size: int,
+        shuffle: bool = True,
+        drop_last: bool = False,
+        shuffle_within_batch: bool = True,
+    ) -> None:
+        """
+        Args:
+            lengths: A sequence of lengths, one per dataset index (len = len(dataset)).
+            batch_size: Number of samples per batch.
+            shuffle: Whether to shuffle the order of batches each epoch.
+            drop_last: Drop the last batch if it's smaller than batch_size.
+            shuffle_within_batch: Whether to shuffle sample order inside each batch.
+        """
+        if batch_size <= 0:
+            raise ValueError(f"batch_size must be positive, got {batch_size}")
+        if len(lengths) == 0:
+            raise ValueError("lengths must be non-empty")
+
+        self.lengths = list(lengths)
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        self.drop_last = drop_last
+        self.shuffle_within_batch = shuffle_within_batch
+
+        # Sort indices by length once (ascending).
+        self.sorted_indices = sorted(range(len(self.lengths)),
+                                     key=lambda i: self.lengths[i])
+
+        # Precompute how many batches we'd get.
+        self._num_batches = self._compute_num_batches()
+
+    def _compute_num_batches(self) -> int:
+        n = len(self.sorted_indices)
+        if self.drop_last:
+            return n // self.batch_size
+        else:
+            return math.ceil(n / self.batch_size)
+
+    def __len__(self) -> int:
+        return self._num_batches
+
+    def __iter__(self) -> Iterator[List[int]]:
+        # Copy sorted indices so we don’t mutate the original list.
+        indices = self.sorted_indices.copy()
+
+        # Form contiguous batches from the sorted indices.
+        batches: List[List[int]] = []
+        for i in range(0, len(indices), self.batch_size):
+            batch = indices[i:i + self.batch_size]
+            if self.drop_last and len(batch) < self.batch_size:
+                continue
+            batches.append(batch)
+
+        # Shuffle the batch order each epoch.
+        if self.shuffle:
+            random.shuffle(batches)
+
+        # Optionally shuffle inside each batch as well.
+        if self.shuffle_within_batch:
+            for b in batches:
+                random.shuffle(b)
+
+        # Yield batches.
+        for b in batches:
+            yield b
+
 
 def get_dataloaders(
     tokenizer_path: str,
@@ -409,15 +505,37 @@ def get_dataloaders(
     
     # Create collate function
     collate_fn = CollateFunction(pad_value=0.0, label_pad_value=0)
+
+    # 1. Precompute lengths (one-time cost at startup)
+    train_lengths = []
+    for i in tqdm(range(len(train_dataset))):
+        # LibriSpeechDataset.__getitem__ returns 'fbank' [T, 80]
+        # but we don't want to actually compute fbank for all samples here
+        # (that would be expensive). Instead, you can:
+        #
+        # Option A (cheap, if you have lengths stored in HF dataset):
+        #   train_lengths.append(int(train_dataset.dataset[i]["audio"]["array"].shape[0] / hop_size_estimate))
+        #
+        # Option B (simpler but more expensive): just call __getitem__:
+        item = train_dataset[i]
+        train_lengths.append(int(item["fbank"].size(0)))
+
+    # 2. Create the sampler
+    train_batch_sampler = LengthAwareBatchSampler(
+        lengths=train_lengths,
+        batch_size=batch_size,
+        shuffle=True,
+        drop_last=False,
+        shuffle_within_batch=False,
+    )
     
     # Create dataloaders
     train_loader = DataLoader(
         train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
         num_workers=num_workers,
         collate_fn=collate_fn,
         pin_memory=True,
+        batch_sampler=train_batch_sampler,
     )
     
     val_loader = DataLoader(

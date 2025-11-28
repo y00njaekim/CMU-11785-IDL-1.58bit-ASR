@@ -6,7 +6,8 @@ import os
 import sys
 import math
 import argparse
-from typing import Optional, List
+import json
+from typing import Optional, List, Tuple, Union, Any
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -16,6 +17,8 @@ import wandb
 
 from onebit_asr.conformer import ConformerASR
 from onebit_asr.losses import make_att_targets, att_ce_loss, ctc_loss_from_logits, kl_logits
+from onebit_asr.metrics import compute_wer, ctc_beam_search_batch, ids_to_text
+import sentencepiece as spm
 
 # Progress bar (fallback to no-op if tqdm is unavailable)
 from tqdm.auto import tqdm as _tqdm
@@ -56,13 +59,18 @@ def sample_sp_mask(n_layers: int, low_p=0.2, high_p=0.9) -> List[int]:
     return [int(torch.rand(()) < p) for p in probs]
 
 
-def run_epoch(model: ConformerASR, dm, optimizer, sched, device, args, train: bool, 
-              lambda1: float, lambda2: float, gamma_ctc: float):
+def run_epoch(model: ConformerASR, dm, optimizer, sched, device, args, train: bool,
+              lambda1: float, lambda2: float, gamma_ctc: float,
+              spm_processor: Optional[Any] = None) -> Tuple[float, Optional[float], Optional[float], Optional[float]]:
     model.train(train)
     dl = dm.train_dataloader() if train else dm.valid_dataloader()
 
     total = 0.0
     count = 0
+    total_dist_student = 0
+    total_dist_teacher = 0
+    total_dist_fp32 = 0
+    total_words = 0
 
     pbar = _progress(dl, total=len(dl), desc=("Train" if train else "Valid"))
     for batch in pbar:
@@ -110,13 +118,55 @@ def run_epoch(model: ConformerASR, dm, optimizer, sched, device, args, train: bo
             optimizer.step()
             if sched is not None:
                 sched.step()
+        else:
+            # Compute WER for student (1-bit), teacher (2-bit), and fp32 using existing logits
+                        # ---------- Full precision: 32‑bit ----------
+            encf, maskf, ctcf = model(batch, precision=32)
+            if spm_processor is not None:
+                # Student decoding
+                valid_t_s = mask1.sum(dim=1).long()
+                hyp_ids_s = ctc_beam_search_batch(ctc1, valid_t_s, beam_size=args.beam_size, blank_id=blank_id)
+                hyps_s = [ids_to_text(h, spm_processor, token_offset=4) for h in hyp_ids_s]
+                # Teacher decoding
+                valid_t_t = mask2.sum(dim=1).long()
+                hyp_ids_t = ctc_beam_search_batch(ctc2, valid_t_t, beam_size=args.beam_size, blank_id=blank_id)
+                hyps_t = [ids_to_text(h, spm_processor, token_offset=4) for h in hyp_ids_t]
+                # FP32 decoding
+                valid_t_f = maskf.sum(dim=1).long()
+                hyp_ids_f = ctc_beam_search_batch(ctcf, valid_t_f, beam_size=args.beam_size, blank_id=blank_id)
+                hyps_f = [ids_to_text(h, spm_processor, token_offset=4) for h in hyp_ids_f]
+                # References
+                labels = batch['tokens'].cpu().tolist()
+                refs = []
+                for lbl in labels:
+                    valid_lbl = [int(x - 4) for x in lbl if x != 0]
+                    refs.append(spm_processor.decode(valid_lbl))
+                d_s, w = compute_wer(refs, hyps_s)
+                d_t, _ = compute_wer(refs, hyps_t)
+                d_f, _ = compute_wer(refs, hyps_f)
+                total_dist_student += d_s
+                total_dist_teacher += d_t
+                total_dist_fp32 += d_f
+                total_words += w
 
         total += loss.item()
         count += 1
-        # Show current (last) loss on the progress bar
-        pbar.set_postfix(loss=f"{loss.item():.4f}")
-
-    return total / max(1, count)
+        # Show current (last) loss (and WER on eval) on the progress bar
+        if train:
+            pbar.set_postfix(loss=f"{loss.item():.4f}")
+        else:
+            wer_s = (total_dist_student / total_words) if total_words > 0 else 0.0
+            wer_t = (total_dist_teacher / total_words) if total_words > 0 else 0.0
+            wer_f = (total_dist_fp32 / total_words) if total_words > 0 else 0.0
+            pbar.set_postfix(loss=f"{loss.item():.4f}", wer_s=f"{wer_s:.4f}", wer_t=f"{wer_t:.4f}", wer_fp32=f"{wer_f:.4f}")
+    avg_loss = total / max(1, count)
+    if train:
+        return avg_loss, None, None, None
+    else:
+        wer_s = (total_dist_student / total_words) if total_words > 0 else 0.0
+        wer_t = (total_dist_teacher / total_words) if total_words > 0 else 0.0
+        wer_f = (total_dist_fp32 / total_words) if total_words > 0 else 0.0
+        return avg_loss, wer_s, wer_t, wer_f
 
 
 def main():
@@ -152,6 +202,7 @@ def main():
     p.add_argument('--dec_heads', type=int, default=4)
     p.add_argument('--dec_d_ff', type=int, default=1024)
     p.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
+    p.add_argument('--beam_size', type=int, default=10)
     # paper constants
     p.add_argument('--gamma_ctc', type=float, default=0.2)   # Eq. (1)
     p.add_argument('--lambda1', type=float, default=0.5)     # weight for 1-bit & SP losses
@@ -212,20 +263,46 @@ def main():
     total_steps = args.epochs * steps_per_epoch
     sched = WarmupCosine(optimizer, warmup_steps=args.warmup_steps, total_steps=total_steps)
 
-    os.makedirs(args.save_dir, exist_ok=True)
+    # Checkpoint directory per run
+    run_name = (wandb.run.name or f"run-{run_id}") if wandb.run is not None else f"run-{run_id}"
+    run_dir = os.path.join(args.save_dir, run_name)
+    os.makedirs(run_dir, exist_ok=True)
+
+    # Save config for later evaluation
+    config_to_save = dict(vars(args))
+    config_to_save.update({
+        'run_name': run_name,
+        'run_dir': run_dir,
+        'vocab_size': vocab,
+        'special_ids': special,
+    })
+    with open(os.path.join(run_dir, 'config.json'), 'w') as f:
+        json.dump(config_to_save, f, indent=2)
+
+    # Expose run_dir in wandb
+    wandb.config.update({'run_dir': run_dir}, allow_val_change=True)
     best_val = float('inf')
 
+    # Prepare tokenizer for WER decoding
+    sp = spm.SentencePieceProcessor()
+    sp.load(os.path.join('src', 'data', 'tokenizer.model'))  # type: ignore[attr-defined]
+
     for epoch in range(1, args.epochs+1):
-        tr = run_epoch(model, dm, optimizer, sched, device, args, train=True,
+        tr, _, _, _ = run_epoch(model, dm, optimizer, sched, device, args, train=True,
                        lambda1=args.lambda1, lambda2=args.lambda2, gamma_ctc=args.gamma_ctc)
-        va = run_epoch(model, dm, optimizer, sched=None, device=device, args=args, train=False,
-                       lambda1=args.lambda1, lambda2=args.lambda2, gamma_ctc=args.gamma_ctc)
+        va, val_wer_student, val_wer_teacher, val_wer_fp32 = run_epoch(model, dm, optimizer, sched=None, device=device, args=args, train=False,
+                                lambda1=args.lambda1, lambda2=args.lambda2, gamma_ctc=args.gamma_ctc,
+                                spm_processor=sp)
         print(f"Epoch {epoch}: train_loss={tr:.4f}  valid_loss={va:.4f}")
+        print(f"           valid_wer_student={val_wer_student:.4f}  valid_wer_teacher={val_wer_teacher:.4f}  valid_wer_fp32={val_wer_fp32:.4f}")
         
         wandb.log({
             'epoch': epoch,
             'train_loss': tr,
             'valid_loss': va,
+            'valid_wer_1bit': val_wer_student,
+            'valid_wer_2bit': val_wer_teacher,
+            'valid_wer_32bit': val_wer_fp32,
         })
         ckpt = {
             'epoch': epoch,
@@ -234,10 +311,10 @@ def main():
             'args': vars(args),
             'val_loss': va,
         }
-        torch.save(ckpt, os.path.join(args.save_dir, f'ckpt_last.pt'))
+        torch.save(ckpt, os.path.join(run_dir, f'ckpt_last.pt'))
         if va < best_val:
             best_val = va
-            torch.save(ckpt, os.path.join(args.save_dir, 'best.pt'))
+            torch.save(ckpt, os.path.join(run_dir, 'best.pt'))
             print(f"  ✓ New best model saved with valid_loss={best_val:.4f}")
 
 

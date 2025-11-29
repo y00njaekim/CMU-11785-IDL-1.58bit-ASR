@@ -201,9 +201,11 @@ def setup():
     local_rank = int(os.environ.get('LOCAL_RANK', 0))
     
     if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
-        dist.init_process_group(backend='nccl', init_method='env://')
+        # Set CUDA device before initializing process group to avoid NCCL warnings
         torch.cuda.set_device(local_rank)
         device = torch.device(f'cuda:{local_rank}')
+        # Initialize process group - setting device above should prevent NCCL from guessing
+        dist.init_process_group(backend='nccl', init_method='env://')
         return rank, world_size, device
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -220,7 +222,7 @@ def main(args=None):
         p.add_argument('--save_dir', type=str, default='./checkpoints')
         p.add_argument('--epochs', type=int, default=10)
         p.add_argument('--batch_size', type=int, default=2)
-        p.add_argument('--num_workers', type=int, default=4)
+        p.add_argument('--num_workers', type=int, default=2, help="Number of DataLoader workers (reduce if you see warnings about too many workers)")
         p.add_argument('--lr', type=float, default=5e-4)
         p.add_argument('--warmup_steps', type=int, default=4000)
         p.add_argument('--input_dim', type=int, default=80)
@@ -292,7 +294,12 @@ def main(args=None):
         sys.stdout = StringIO()
         sys.stderr = StringIO()
     
-    dm = LibriSpeechDataModule(args.data_dir, batch_size=args.batch_size, num_workers=args.num_workers)
+    dm = LibriSpeechDataModule(
+    args.data_dir, 
+    batch_size=args.batch_size, 
+    num_workers=args.num_workers,
+    train_fraction=args.train_data_fraction
+    )
     
     if rank != 0:
         sys.stdout = old_stdout
@@ -301,52 +308,30 @@ def main(args=None):
     train_dl = dm.train_dataloader()
     valid_dl = dm.valid_dataloader()
     
-    if args.train_data_fraction < 1.0:
-        base_dataloader = train_dl._base
-        base_dataset = base_dataloader.dataset
-        total_samples = len(base_dataset)
-        subset_size = int(total_samples * args.train_data_fraction)
-        
-        generator = torch.Generator().manual_seed(42)
-        indices = torch.randperm(total_samples, generator=generator)[:subset_size].tolist()
-        subset_dataset = Subset(base_dataset, indices)
-        
-        from torch.utils.data import DataLoader
-        if use_ddp:
-            subset_sampler = DistributedSampler(subset_dataset, num_replicas=world_size, rank=rank, shuffle=True)
-            subset_dl = DataLoader(
-                subset_dataset,
-                batch_size=args.batch_size,
-                sampler=subset_sampler,
-                num_workers=args.num_workers,
-                collate_fn=base_dataloader.collate_fn,
-                pin_memory=True,
-            )
-        else:
-            subset_dl = DataLoader(
-                subset_dataset,
-                batch_size=args.batch_size,
-                shuffle=True,
-                num_workers=args.num_workers,
-                collate_fn=base_dataloader.collate_fn,
-                pin_memory=base_dataloader.pin_memory if hasattr(base_dataloader, 'pin_memory') else True,
-            )
-        
-        from onebit_asr.dataloader_stub import _MappedLoader
-        token_offset = train_dl._token_offset
-        train_dl = _MappedLoader(subset_dl, token_offset=token_offset)
-        
-        if rank == 0:
-            print(f"Using {subset_size}/{total_samples} training samples ({args.train_data_fraction*100:.1f}%)")
-    elif use_ddp:
+    # Note: Dataset slicing is now handled in get_dataloaders() to avoid loading full dataset
+    # DDP sampler handling - LengthAwareBatchSampler uses batch_sampler which conflicts with DDP's sampler
+    # So we need to replace it with a regular DataLoader + DistributedSampler for DDP
+    if use_ddp:
         if hasattr(train_dl, '_base'):
-            train_sampler = DistributedSampler(train_dl._base.dataset, num_replicas=world_size, rank=rank, shuffle=True)
+            # Get the underlying dataset (might be a Subset)
+            base_dataset = train_dl._base.dataset
+            # If it's a Subset, we need to use it as-is (DistributedSampler works with Subset)
+            # Set num_workers to 0 for DDP to avoid multiprocessing conflicts that can cause segfaults
+            # DDP already uses multiple processes, so additional workers can cause issues
+            ddp_num_workers = 0
+            train_sampler = DistributedSampler(
+                base_dataset, 
+                num_replicas=world_size, 
+                rank=rank, 
+                shuffle=True,
+                drop_last=False
+            )
             from torch.utils.data import DataLoader
             train_dl_new = DataLoader(
-                train_dl._base.dataset,
+                base_dataset,
                 batch_size=args.batch_size,
-                sampler=train_sampler,
-                num_workers=args.num_workers,
+                sampler=train_sampler,  # Use sampler instead of batch_sampler for DDP
+                num_workers=ddp_num_workers,
                 collate_fn=train_dl._base.collate_fn,
                 pin_memory=True,
             )
@@ -428,9 +413,13 @@ def main(args=None):
         use_checkpoint=args.use_checkpoint,
     ).to(device)
     
+    # Synchronize all processes before DDP wrapping to ensure model is initialized on all ranks
     if use_ddp:
+        dist.barrier()
         local_rank = int(os.environ.get('LOCAL_RANK', 0))
         model = nn.parallel.DistributedDataParallel(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
+        # Synchronize again after DDP wrapping
+        dist.barrier()
 
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.98), weight_decay=1e-2)
 

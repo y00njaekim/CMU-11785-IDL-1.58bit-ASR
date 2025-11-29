@@ -1,4 +1,7 @@
 import os
+# Force SentencePiece to use a single thread per process.
+# This fixes SegFaults (Exit -11) when running tokenizers in DDP.
+os.environ.setdefault("SPM_NUM_THREADS", "1")
 import json
 import io
 import torch
@@ -7,7 +10,7 @@ import sentencepiece as spm
 import numpy as np
 import soundfile as sf
 from typing import Dict, List, Optional, Tuple
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, Subset
 from datasets import load_from_disk, concatenate_datasets, Audio
 from tqdm import tqdm
 
@@ -47,8 +50,9 @@ class LibriSpeechDataset(Dataset):
         self.cmvn_stats = cmvn_stats
         self.apply_spec_augment = apply_spec_augment
         
-        self.tokenizer = spm.SentencePieceProcessor()
-        self.tokenizer.load(tokenizer_path)
+        # Lazy initialization of tokenizer to avoid DDP/multiprocessing issues
+        # Initialize tokenizer only when first needed (in __getitem__)
+        self._tokenizer = None
         
         self.dataset = self._load_dataset()
         
@@ -105,6 +109,21 @@ class LibriSpeechDataset(Dataset):
     
     def __len__(self):
         return len(self.dataset)
+    
+    @property
+    def tokenizer(self):
+        """Lazy initialization of tokenizer to avoid DDP/multiprocessing issues."""
+        if self._tokenizer is None:
+            # Use a lock-free approach: each process initializes its own tokenizer
+            # This avoids race conditions in SentencePiece's C++ extension
+            # Add a small process-specific delay to avoid simultaneous initialization
+            import time
+            import os
+            rank = int(os.environ.get('RANK', 0))
+            time.sleep(0.01 * rank)  # Stagger initialization by rank
+            self._tokenizer = spm.SentencePieceProcessor()
+            self._tokenizer.load(self.tokenizer_path)
+        return self._tokenizer
     
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         """
@@ -486,6 +505,7 @@ def get_dataloaders(
     cmvn_stats_path: str,
     batch_size: int = 16,
     num_workers: int = 4,
+    train_fraction: float = 1.0,
 ) -> Tuple[DataLoader, DataLoader, DataLoader]:
     """
     Create train, validation, and test dataloaders.
@@ -497,6 +517,7 @@ def get_dataloaders(
         cmvn_stats_path: Path to precomputed CMVN statistics
         batch_size: Batch size for dataloaders
         num_workers: Number of worker processes for data loading
+        train_fraction: Fraction of training data to use (0.0-1.0, default: 1.0 for 100%)
     
     Returns:
         Tuple of (train_loader, val_loader, test_loader)
@@ -546,7 +567,21 @@ def get_dataloaders(
     # Create collate function
     collate_fn = CollateFunction(pad_value=0.0, label_pad_value=0)
 
-    # 1. Precompute lengths (one-time cost at startup)
+    # Slice training dataset BEFORE computing lengths to avoid processing unused data
+    if train_fraction < 1.0:
+        total_samples = len(train_dataset)
+        subset_size = int(total_samples * train_fraction)
+        
+        # Create a deterministic random permutation
+        g = torch.Generator()
+        g.manual_seed(42)
+        indices = torch.randperm(total_samples, generator=g)[:subset_size].tolist()
+        
+        # Create a Subset BEFORE computing lengths
+        train_dataset = Subset(train_dataset, indices)
+        print(f"Using {subset_size}/{total_samples} training samples ({train_fraction*100:.1f}%)")
+
+    # 1. Precompute lengths (one-time cost at startup) - now only for the subset
     train_lengths = []
     for i in tqdm(range(len(train_dataset))):
         # LibriSpeechDataset.__getitem__ returns 'fbank' [T, 80]

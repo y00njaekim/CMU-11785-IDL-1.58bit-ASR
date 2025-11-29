@@ -1,11 +1,16 @@
 import os
+# Force SentencePiece to use a single thread per process.
+# This fixes SegFaults (Exit -11) when running tokenizers in DDP.
+os.environ.setdefault("SPM_NUM_THREADS", "1")
 import json
+import io
 import torch
 import torchaudio
 import sentencepiece as spm
 import numpy as np
+import soundfile as sf
 from typing import Dict, List, Optional, Tuple
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, Subset
 from datasets import load_from_disk, concatenate_datasets, Audio
 from tqdm import tqdm
 
@@ -45,8 +50,9 @@ class LibriSpeechDataset(Dataset):
         self.cmvn_stats = cmvn_stats
         self.apply_spec_augment = apply_spec_augment
         
-        self.tokenizer = spm.SentencePieceProcessor()
-        self.tokenizer.load(tokenizer_path)
+        # Lazy initialization of tokenizer to avoid DDP/multiprocessing issues
+        # Initialize tokenizer only when first needed (in __getitem__)
+        self._tokenizer = None
         
         self.dataset = self._load_dataset()
         
@@ -87,7 +93,8 @@ class LibriSpeechDataset(Dataset):
 
             print(f"  Loading {split_name} from {dataset_path}...")
             ds = load_from_disk(dataset_path)
-            ds = ds.cast_column("audio", Audio(sampling_rate=16000))
+            # Use decode=False to avoid torchcodec dependency, we'll decode manually with soundfile
+            ds = ds.cast_column("audio", Audio(decode=False, sampling_rate=16000))
             
             print(f"    Loaded {len(ds)} samples")
             datasets.append(ds)
@@ -103,6 +110,21 @@ class LibriSpeechDataset(Dataset):
     def __len__(self):
         return len(self.dataset)
     
+    @property
+    def tokenizer(self):
+        """Lazy initialization of tokenizer to avoid DDP/multiprocessing issues."""
+        if self._tokenizer is None:
+            # Use a lock-free approach: each process initializes its own tokenizer
+            # This avoids race conditions in SentencePiece's C++ extension
+            # Add a small process-specific delay to avoid simultaneous initialization
+            import time
+            import os
+            rank = int(os.environ.get('RANK', 0))
+            time.sleep(0.01 * rank)  # Stagger initialization by rank
+            self._tokenizer = spm.SentencePieceProcessor()
+            self._tokenizer.load(self.tokenizer_path)
+        return self._tokenizer
+    
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         """
         Returns:
@@ -114,9 +136,46 @@ class LibriSpeechDataset(Dataset):
         """
         item = self.dataset[idx]
         
-        waveform = torch.FloatTensor(item['audio']['array']).unsqueeze(0)
-        sample_rate = item['audio']['sampling_rate']
+        # Decode audio manually using soundfile to avoid torchcodec dependency
+        audio_data = item['audio']
         
+        if isinstance(audio_data, dict):
+            if 'bytes' in audio_data and audio_data['bytes']:
+                # Audio is stored as bytes in Arrow format, decode it
+                audio_bytes = audio_data['bytes']
+                waveform, sample_rate = sf.read(io.BytesIO(audio_bytes))
+                waveform = torch.FloatTensor(waveform)
+            elif 'path' in audio_data and audio_data['path']:
+                # Try to read from path if it's an absolute path
+                audio_path = audio_data['path']
+                if os.path.isabs(audio_path) and os.path.exists(audio_path):
+                    waveform, sample_rate = sf.read(audio_path)
+                    waveform = torch.FloatTensor(waveform)
+                else:
+                    # Path is relative or doesn't exist, try bytes or fall back to torchaudio
+                    if 'bytes' in audio_data and audio_data['bytes']:
+                        audio_bytes = audio_data['bytes']
+                        waveform, sample_rate = sf.read(io.BytesIO(audio_bytes))
+                        waveform = torch.FloatTensor(waveform)
+                    else:
+                        raise ValueError(f"Audio path '{audio_path}' doesn't exist and no bytes available")
+            elif 'array' in audio_data:
+                # Already decoded (shouldn't happen with decode=False, but handle it)
+                waveform = torch.FloatTensor(audio_data['array'])
+                sample_rate = audio_data.get('sampling_rate', 16000)
+            else:
+                raise ValueError(f"Audio data format not recognized: {list(audio_data.keys())}")
+        else:
+            raise ValueError(f"Audio data is not a dict: {type(audio_data)}")
+        
+        # Ensure waveform is 1D, then add channel dimension
+        if waveform.dim() == 1:
+            waveform = waveform.unsqueeze(0)
+        elif waveform.dim() == 2:
+            # If stereo, take first channel
+            waveform = waveform[0:1]
+        
+        # Resample if needed
         if sample_rate != 16000:
             resampler = torchaudio.transforms.Resample(sample_rate, 16000)
             waveform = resampler(waveform)
@@ -446,6 +505,7 @@ def get_dataloaders(
     cmvn_stats_path: str,
     batch_size: int = 16,
     num_workers: int = 4,
+    train_fraction: float = 1.0,
 ) -> Tuple[DataLoader, DataLoader, DataLoader]:
     """
     Create train, validation, and test dataloaders.
@@ -457,6 +517,7 @@ def get_dataloaders(
         cmvn_stats_path: Path to precomputed CMVN statistics
         batch_size: Batch size for dataloaders
         num_workers: Number of worker processes for data loading
+        train_fraction: Fraction of training data to use (0.0-1.0, default: 1.0 for 100%)
     
     Returns:
         Tuple of (train_loader, val_loader, test_loader)
@@ -506,7 +567,21 @@ def get_dataloaders(
     # Create collate function
     collate_fn = CollateFunction(pad_value=0.0, label_pad_value=0)
 
-    # 1. Precompute lengths (one-time cost at startup)
+    # Slice training dataset BEFORE computing lengths to avoid processing unused data
+    if train_fraction < 1.0:
+        total_samples = len(train_dataset)
+        subset_size = int(total_samples * train_fraction)
+        
+        # Create a deterministic random permutation
+        g = torch.Generator()
+        g.manual_seed(42)
+        indices = torch.randperm(total_samples, generator=g)[:subset_size].tolist()
+        
+        # Create a Subset BEFORE computing lengths
+        train_dataset = Subset(train_dataset, indices)
+        print(f"Using {subset_size}/{total_samples} training samples ({train_fraction*100:.1f}%)")
+
+    # 1. Precompute lengths (one-time cost at startup) - now only for the subset
     train_lengths = []
     for i in tqdm(range(len(train_dataset))):
         # LibriSpeechDataset.__getitem__ returns 'fbank' [T, 80]

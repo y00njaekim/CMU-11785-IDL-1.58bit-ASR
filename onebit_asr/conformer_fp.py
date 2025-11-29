@@ -305,12 +305,33 @@ class ConformerASR(nn.Module):
                                           dec_d_ff, dec_dropout, pad_id)
         self.ctc_head = nn.Linear(enc_d_model, vocab_size)
 
-    def forward(self, batch, precision: int, sp_mask=None):
-        # batch must contain: feats [B,T,F], feat_lens [B], tokens [B,U], token_lens [B]
+    def forward(self, batch, precision: int, sp_mask=None, tgt_inp=None, tgt_pad_mask=None):
+        # 1. Run Encoder
+        # batch must contain: feats [B,T,F], feat_lens [B]
         enc_out, enc_mask = self.encoder(batch['feats'], batch['feat_lens'], precision, sp_mask)
+        
+        # 2. Run CTC Head
         logits_ctc = self.ctc_head(enc_out)  # [B,T,V]
-        return enc_out, enc_mask, logits_ctc
 
+        # 3. Run Decoder (if targets provided)
+        logits_dec = None
+        if tgt_inp is not None and tgt_pad_mask is not None:
+            # We assume the decoder is trained alongside the encoder
+            # Validate shapes before decoder call to catch issues early
+            B_enc, T_enc = enc_out.shape[:2]
+            B_tgt, T_tgt = tgt_inp.shape[:2]
+            if B_enc != B_tgt:
+                raise ValueError(f"Batch size mismatch: enc_out {B_enc} vs tgt_inp {B_tgt}")
+            if enc_mask.shape[0] != B_enc or enc_mask.shape[1] != T_enc:
+                raise ValueError(f"enc_mask shape {enc_mask.shape} doesn't match enc_out {enc_out.shape[:2]}")
+            if tgt_pad_mask.shape != tgt_inp.shape:
+                raise ValueError(f"tgt_pad_mask shape {tgt_pad_mask.shape} doesn't match tgt_inp {tgt_inp.shape}")
+            
+            logits_dec = self.decoder(tgt_inp, enc_out, enc_mask, tgt_pad_mask)
+            
+        return enc_out, enc_mask, logits_ctc, logits_dec
+
+    # You can keep this for inference, but do not use it during DDP training
     def decode_logits(self, enc_out, enc_mask, tgt_inp, tgt_pad_mask):
         return self.decoder(tgt_inp, enc_out, enc_mask, tgt_pad_mask)
 

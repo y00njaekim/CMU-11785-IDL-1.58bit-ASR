@@ -53,6 +53,7 @@ Thumbs.db
 *.log
 logs/
 tensorboard/
+train_*
 
 # Jupyter
 .ipynb_checkpoints/
@@ -66,3 +67,7 @@ wandb/
 
 # WandB API Key
 wandb_api_key.txt
+
+# Environment variables
+.env
+.env.local

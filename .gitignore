@@ -53,6 +53,7 @@ Thumbs.db
 *.log
 logs/
 tensorboard/
+train_*
 
 # Jupyter
 .ipynb_checkpoints/

@@ -307,7 +307,7 @@ class ConformerASR(nn.Module):
 
     def forward(self, batch, precision: int, sp_mask=None, tgt_inp=None, tgt_pad_mask=None):
         # 1. Run Encoder
-        # batch must contain: feats [B,T,F], feat_lens [B], tokens [B,U], token_lens [B]
+        # batch must contain: feats [B,T,F], feat_lens [B]
         enc_out, enc_mask = self.encoder(batch['feats'], batch['feat_lens'], precision, sp_mask)
         
         # 2. Run CTC Head
@@ -331,6 +331,7 @@ class ConformerASR(nn.Module):
             
         return enc_out, enc_mask, logits_ctc, logits_dec
 
+    # You can keep this for inference, but do not use it during DDP training
     def decode_logits(self, enc_out, enc_mask, tgt_inp, tgt_pad_mask):
         return self.decoder(tgt_inp, enc_out, enc_mask, tgt_pad_mask)
 

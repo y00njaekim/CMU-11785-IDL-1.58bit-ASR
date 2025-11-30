@@ -107,14 +107,22 @@ def ctc_beam_search(logits: torch.Tensor, beam_size: int = 10, blank_id: int = 3
                 lp_c = float(lp)
                 new_prefix = prefix + (c,)
 
-                # If same as last char, only non-blank transitions from blank
+                # If same as last char
                 if c == last:
-                    # stay on same prefix (don't add repeated char)
-                    p_nb_same = _logsumexp(new_beams.get(prefix, (-math.inf, -math.inf))[1], p_b + lp_c)
-                    p_b_same = new_beams.get(prefix, (-math.inf, -math.inf))[0]
-                    new_beams[prefix] = (p_b_same, p_nb_same)
+                    # 1. p_nb + c -> same prefix (collapsed)
+                    # We update the p_nb component of new_beams[prefix]
+                    p_b_curr, p_nb_curr = new_beams.get(prefix, (-math.inf, -math.inf))
+                    p_nb_curr = _logsumexp(p_nb_curr, p_nb + lp_c)
+                    new_beams[prefix] = (p_b_curr, p_nb_curr)
+
+                    # 2. p_b + c -> extended prefix (repeated char)
+                    # We update the p_nb component of new_beams[new_prefix]
+                    p_b_next, p_nb_next = new_beams.get(new_prefix, (-math.inf, -math.inf))
+                    p_nb_next = _logsumexp(p_nb_next, p_b + lp_c)
+                    new_beams[new_prefix] = (p_b_next, p_nb_next)
                 else:
                     # extend prefix
+                    # Both p_b + c and p_nb + c -> extended prefix
                     prev_pb, prev_pnb = new_beams.get(new_prefix, (-math.inf, -math.inf))
                     p_nb_ext = _logsumexp(prev_pnb, _logsumexp(p_b + lp_c, p_nb + lp_c))
                     new_beams[new_prefix] = (prev_pb, p_nb_ext)

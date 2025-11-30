@@ -23,11 +23,11 @@
 # File: dataloader_stub.py
 # --------------------------------------------------------------
 
-
-from typing import Dict, Optional, Iterator, Any
+from typing import Dict, Optional, Iterator, Any, List
 import torch
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Subset
 import os
+import random
 
 # Use the real dataset/dataloaders from src.data.dataset
 try:
@@ -35,9 +35,9 @@ try:
     import sentencepiece as spm
 except Exception as e:
     raise e
-    # Defer import errors until class construction to avoid breaking unrelated usages
-    get_dataloaders = None  # type: ignore
-    spm = None  # type: ignore
+    get_dataloaders = None 
+    spm = None
+
 
 class _DummyLibriSpeechDataset(Dataset):
     """A tiny synthetic dataset that returns fixed-shape dummy batches.
@@ -155,19 +155,7 @@ class LibriSpeechDataModuleDummy:
         return self._special_ids
 
 class LibriSpeechDataModule:
-    """DataModule that adapts src.data.dataset loaders to the expected training interface.
-
-    Exposes train_dataloader()/valid_dataloader() yielding batches with keys:
-      - 'feats': FloatTensor [B, T, F]
-      - 'feat_lens': LongTensor [B]
-      - 'tokens': LongTensor [B, U] (no BOS/EOS inside)
-      - 'token_lens': LongTensor [B]
-
-    Notes on vocabulary and special ids:
-      We reserve the first four ids for special tokens: pad=0, bos=1, eos=2, blank=3.
-      The SentencePiece vocabulary from the tokenizer is offset by +4 so that
-      true tokens occupy ids [4 .. 4+V_spm-1]. Padding remains 0.
-    """
+    """DataModule that adapts src.data.dataset loaders to the expected training interface."""
 
     def __init__(
         self,
@@ -176,10 +164,11 @@ class LibriSpeechDataModule:
         num_workers: int = 4,
         tokenizer_path: Optional[str] = None,
         cmvn_stats_path: Optional[str] = None,
+        train_fraction: float = 1.0,  # <--- NEW ARGUMENT
     ) -> None:
         if get_dataloaders is None or spm is None:
             raise ImportError(
-                "Failed to import dataset utilities or sentencepiece. Ensure dependencies are installed and src is on PYTHONPATH."
+                "Failed to import dataset utilities. Ensure src is on PYTHONPATH."
             )
 
         self._data_dir = data_dir
@@ -190,30 +179,26 @@ class LibriSpeechDataModule:
         self._tokenizer_path = tokenizer_path or os.path.join("src", "data", "tokenizer.model")
         self._cmvn_stats_path = cmvn_stats_path or os.path.join("src", "data", "cmvn_stats.pt")
 
-        # Load tokenizer to determine base vocab size
-        self._sp = spm.SentencePieceProcessor()
+        # Lazy initialization of tokenizer to avoid DDP/multiprocessing issues
+        # Initialize tokenizer only when first needed (in vocab_size() or special_ids())
+        self._sp = None
         if not os.path.exists(self._tokenizer_path):
             raise FileNotFoundError(f"Tokenizer not found at: {self._tokenizer_path}")
-        self._sp.load(self._tokenizer_path)  # type: ignore[attr-defined]
 
         # Reserve first 4 ids for specials and offset real tokens by +4
         self._token_offset = 4
-        self._vocab_size = int(self._sp.get_piece_size()) + self._token_offset  # type: ignore[attr-defined]
-        self._special_ids = {
-            'pad_id': 0,
-            'bos_id': 1,
-            'eos_id': 2,
-            'blank_id': 3,
-        }
+        # Vocab size and special ids will be computed lazily when needed
+        self._vocab_size = None
+        self._special_ids = None
 
-        # Instantiate underlying dataloaders from the dataset module
-        # Note: src.data.dataset internally uses data located under ./data
-        # The passed data_dir is kept for API compatibility; datasets read from ./data
+        # Instantiate underlying dataloaders
+        # Pass train_fraction to get_dataloaders so slicing happens BEFORE computing lengths
         train_dl, val_dl, _test_dl = get_dataloaders(
             tokenizer_path=self._tokenizer_path,
             cmvn_stats_path=self._cmvn_stats_path,
             batch_size=self._batch_size,
             num_workers=self._num_workers,
+            train_fraction=train_fraction,
         )
 
         # Wrap loaders to map keys and shift token ids
@@ -226,22 +211,36 @@ class LibriSpeechDataModule:
     def valid_dataloader(self) -> Any:
         return self._valid_dl
 
+    def _ensure_tokenizer_loaded(self):
+        """Lazy initialization of tokenizer to avoid DDP/multiprocessing issues."""
+        if self._sp is None:
+            # Add a small process-specific delay to avoid simultaneous initialization
+            import time
+            import os
+            rank = int(os.environ.get('RANK', 0))
+            time.sleep(0.01 * rank)  # Stagger initialization by rank
+            self._sp = spm.SentencePieceProcessor()
+            self._sp.load(self._tokenizer_path)
+            # Compute vocab_size and special_ids once tokenizer is loaded
+            self._vocab_size = int(self._sp.get_piece_size()) + self._token_offset
+            self._special_ids = {
+                'pad_id': 0,
+                'bos_id': 1,
+                'eos_id': 2,
+                'blank_id': 3,
+            }
+
     def vocab_size(self) -> int:
+        self._ensure_tokenizer_loaded()
         return self._vocab_size
 
     def special_ids(self) -> Dict[str, int]:
+        self._ensure_tokenizer_loaded()
         return self._special_ids
 
 
 class _MappedLoader:
-    """Thin wrapper that maps batch keys from src.data.dataset to training API.
-
-    Maps:
-      fbank -> feats
-      fbank_lengths -> feat_lens
-      labels (+offset, preserving pads) -> tokens
-      label_lengths -> token_lens
-    """
+    """Thin wrapper that maps batch keys from src.data.dataset to training API."""
 
     def __init__(self, base: DataLoader, token_offset: int) -> None:
         self._base = base

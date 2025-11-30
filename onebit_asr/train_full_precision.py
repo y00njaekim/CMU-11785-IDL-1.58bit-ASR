@@ -11,7 +11,6 @@ import math
 import argparse
 import json
 import signal
-import contextlib
 from typing import Optional, List, Tuple, Union, Any
 import torch
 import torch.nn as nn
@@ -23,7 +22,7 @@ import socket, time
 import wandb
 from dotenv import load_dotenv
 
-from onebit_asr.conformer import ConformerASR
+from onebit_asr.conformer_fp import ConformerASR
 from onebit_asr.losses import make_att_targets, att_ce_loss, ctc_loss_from_logits, kl_logits
 from onebit_asr.metrics import compute_wer, ctc_beam_search_batch, ids_to_text
 import sentencepiece as spm
@@ -78,16 +77,11 @@ def run_epoch(model: Union[ConformerASR, nn.parallel.DistributedDataParallel], d
         if sampler is not None:
             sampler.set_epoch(getattr(run_epoch, '_epoch', 0))
 
-    model_unwrapped = model.module if isinstance(model, nn.parallel.DistributedDataParallel) else model
-
     total = 0.0
     count = 0
-    total_dist_student = 0
-    total_dist_teacher = 0
     total_dist_fp32 = 0
     total_words = 0
 
-    pbar = _progress(dl, total=len(dl), desc=("Train" if train else "Valid"), disable=(rank != 0))
     pbar = _progress(dl, total=len(dl), desc=("Train" if train else "Valid"), disable=(rank != 0))
     for batch in pbar:
         if _shutdown_flag:
@@ -96,125 +90,87 @@ def run_epoch(model: Union[ConformerASR, nn.parallel.DistributedDataParallel], d
         special = dm.special_ids()
         bos_id, eos_id, pad_id, blank_id = special['bos_id'], special['eos_id'], special['pad_id'], special['blank_id']
 
+        with torch.set_grad_enabled(train):
+            t_inp, t_out, t_pad = make_att_targets(batch['tokens'], bos_id, eos_id, pad_id)
+            
+            # ---------- FP32 training ----------
+            # We pass targets into the forward pass so decoding happens inside DDP context
+            enc, mask, ctc, logits = model(
+                batch, 
+                precision=32, 
+                tgt_inp=t_inp, 
+                tgt_pad_mask=t_pad
+            )
+            
+            # Ensure logits is not None (should always be provided during training)
+            if logits is None:
+                raise RuntimeError("Decoder logits are None - check model forward implementation")
+            
+            Latt = att_ce_loss(logits, t_out, pad_id, label_smoothing=0.1)
+            ctc_lens = mask.sum(dim=1).long()
+            Lctc = ctc_loss_from_logits(ctc, ctc_lens, batch['tokens'], batch['token_lens'], blank_id)
+            loss = (1-gamma_ctc)*Latt + gamma_ctc*Lctc
+            
+            if train:
+                # Memory cleanup to avoid OOM
+                del enc, mask, ctc, logits
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
         if train:
             optimizer.zero_grad()
-
-        # Helper to handle DDP no_sync
-        def get_context(is_last=False):
-            if train and not is_last and hasattr(model, "no_sync"):
-                # if rank == 0: print(f"DEBUG: Entering no_sync (is_last={is_last})")
-                return model.no_sync()
-            # if rank == 0: print(f"DEBUG: NOT using no_sync (is_last={is_last})")
-            return contextlib.nullcontext()
-
-        # ---------- Teacher: 2‑bit ----------
-        with get_context(is_last=False):
-            with torch.set_grad_enabled(train):
-                t_inp, t_out, t_pad = make_att_targets(batch['tokens'], bos_id, eos_id, pad_id)
-                
-                enc2, mask2, ctc2, logits2 = model(batch, precision=2, tgt_inp=t_inp, tgt_pad_mask=t_pad)
-                # logits2 = model_unwrapped.decode_logits(enc2, mask2, t_inp, t_pad)
-                Latt2 = att_ce_loss(logits2, t_out, pad_id, label_smoothing=0.1)
-                ctc_lens2 = mask2.sum(dim=1).long()
-                Lctc2 = ctc_loss_from_logits(ctc2, ctc_lens2, batch['tokens'], batch['token_lens'], blank_id)
-                Lint2 = (1-gamma_ctc)*Latt2 + gamma_ctc*Lctc2
-            
-            if train:
-                Lint2.backward()
-
-        # ---------- Student: 1‑bit ----------
-        with get_context(is_last=False):
-            with torch.set_grad_enabled(train):
-                enc1, mask1, ctc1, logits1 = model(batch, precision=1, tgt_inp=t_inp, tgt_pad_mask=t_pad)
-                # logits1 = model_unwrapped.decode_logits(enc1, mask1, t_inp, t_pad)
-                Latt1 = att_ce_loss(logits1, t_out, pad_id, label_smoothing=0.1)
-                ctc_lens1 = mask1.sum(dim=1).long()
-                Lctc1 = ctc_loss_from_logits(ctc1, ctc_lens1, batch['tokens'], batch['token_lens'], blank_id)
-                Lint1 = (1-gamma_ctc)*Latt1 + gamma_ctc*Lctc1
-                Lkl1 = kl_logits(logits1, logits2.detach(), t_pad)
-                
-                loss_student = lambda1*Lint1 + lambda2*Lkl1
-            
-            if train:
-                loss_student.backward()
-
-        # ---------- Stochastic Precision sub‑model ----------
-        with get_context(is_last=True):
-            with torch.set_grad_enabled(train):
-                sp_mask = sample_sp_mask(n_layers=args.enc_layers)
-                encs, masks, ctcs, logitss = model(batch, precision=2, sp_mask=sp_mask, tgt_inp=t_inp, tgt_pad_mask=t_pad)
-                # logitss = model_unwrapped.decode_logits(encs, masks, t_inp, t_pad)
-                Latt_s = att_ce_loss(logitss, t_out, pad_id, label_smoothing=0.1)
-                ctc_lens_s = masks.sum(dim=1).long()
-                Lctc_s = ctc_loss_from_logits(ctcs, ctc_lens_s, batch['tokens'], batch['token_lens'], blank_id)
-                Lint_s = (1-gamma_ctc)*Latt_s + gamma_ctc*Lctc_s
-                Lkl_s = kl_logits(logitss, logits2.detach(), t_pad)
-
-                loss_stoch = lambda1*Lint_s + lambda2*Lkl_s
-            
-            if train:
-                loss_stoch.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
-                optimizer.step()
-                if sched is not None:
-                    sched.step()
-
-        # Calculate total loss for reporting
-        loss_val = Lint2.item() + (loss_student.item() if isinstance(loss_student, torch.Tensor) else loss_student) + (loss_stoch.item() if isinstance(loss_stoch, torch.Tensor) else loss_stoch)
-            
-        if train:
-            del enc2, mask2, ctc2, enc1, mask1, ctc1, encs, masks, ctcs
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+            optimizer.step()
+            if sched is not None:
+                sched.step()
         else:
-            # Compute WER for student (1-bit), teacher (2-bit), and fp32 using existing logits
-                        # ---------- Full precision: 32‑bit ----------
-            encf, maskf, ctcf, _ = model(batch, precision=32)
+            # ---------- Validation / Metrics ----------
             if spm_processor is not None:
-                # Student decoding
-                valid_t_s = mask1.sum(dim=1).long()
-                hyp_ids_s = ctc_beam_search_batch(ctc1, valid_t_s, beam_size=args.beam_size, blank_id=blank_id)
-                hyps_s = [ids_to_text(h, spm_processor, token_offset=4) for h in hyp_ids_s]
-                # Teacher decoding
-                valid_t_t = mask2.sum(dim=1).long()
-                hyp_ids_t = ctc_beam_search_batch(ctc2, valid_t_t, beam_size=args.beam_size, blank_id=blank_id)
-                hyps_t = [ids_to_text(h, spm_processor, token_offset=4) for h in hyp_ids_t]
-                # FP32 decoding
-                valid_t_f = maskf.sum(dim=1).long()
-                hyp_ids_f = ctc_beam_search_batch(ctcf, valid_t_f, beam_size=args.beam_size, blank_id=blank_id)
-                hyps_f = [ids_to_text(h, spm_processor, token_offset=4) for h in hyp_ids_f]
+                # FP32 decoding (Beam Search)
+                # Note: enc, mask, ctc, logits are available from the forward pass above
+                valid_t = mask.sum(dim=1).long()
+                hyp_ids = ctc_beam_search_batch(ctc, valid_t, beam_size=args.beam_size, blank_id=blank_id)
+                # Note: token_offset=4 usually handles special tokens in your vocab
+                hyps = [ids_to_text(h, spm_processor, token_offset=4) for h in hyp_ids]
+                
                 # References
                 labels = batch['tokens'].cpu().tolist()
                 refs = []
                 for lbl in labels:
+                    # Filter out padding (0) and adjust for offset if needed
                     valid_lbl = [int(x - 4) for x in lbl if x != 0]
                     refs.append(spm_processor.decode(valid_lbl))
-                d_s, w = compute_wer(refs, hyps_s)
-                d_t, _ = compute_wer(refs, hyps_t)
-                d_f, _ = compute_wer(refs, hyps_f)
-                total_dist_student += d_s
-                total_dist_teacher += d_t
-                total_dist_fp32 += d_f
+                
+                d, w = compute_wer(refs, hyps)
+                total_dist_fp32 += d
                 total_words += w
 
-        total += loss_val
+        total += loss.item()
         count += 1
-        # Show current (last) loss (and WER on eval) on the progress bar
+        
+        # Update Progress Bar
         if train:
-            pbar.set_postfix(loss=f"{loss_val:.4f}")
+            pbar.set_postfix(loss=f"{loss.item():.4f}")
         else:
-            wer_s = (total_dist_student / total_words) if total_words > 0 else 0.0
-            wer_t = (total_dist_teacher / total_words) if total_words > 0 else 0.0
             wer_f = (total_dist_fp32 / total_words) if total_words > 0 else 0.0
-            pbar.set_postfix(loss=f"{loss_val:.4f}", wer_s=f"{wer_s:.4f}", wer_t=f"{wer_t:.4f}", wer_fp32=f"{wer_f:.4f}")
+            pbar.set_postfix(loss=f"{loss.item():.4f}", wer=f"{wer_f:.4f}")
+            
     avg_loss = total / max(1, count)
+    
+    # Calculate Final WER for the epoch
+    if not train:
+        wer_fp32 = (total_dist_fp32 / total_words) if total_words > 0 else 0.0
+    else:
+        wer_fp32 = None
+
+    # Return matching the expected signature: (loss, student_wer, teacher_wer, fp32_wer)
+    # We return 0.0 or None for student/teacher to keep main() compatible
     if train:
         return avg_loss, None, None, None
     else:
-        wer_s = (total_dist_student / total_words) if total_words > 0 else 0.0
-        wer_t = (total_dist_teacher / total_words) if total_words > 0 else 0.0
-        wer_f = (total_dist_fp32 / total_words) if total_words > 0 else 0.0
-        return avg_loss, wer_s, wer_t, wer_f
+        return avg_loss, 0.0, 0.0, wer_fp32
+        
 
 
 _shutdown_flag = False
@@ -231,11 +187,19 @@ def setup():
     local_rank = int(os.environ.get('LOCAL_RANK', 0))
     
     if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
-        # Set CUDA device before initializing process group to avoid NCCL warnings
+        # Set CUDA device BEFORE initializing process group to avoid NCCL warnings
+        # This is critical - the device must be set before NCCL initialization
         torch.cuda.set_device(local_rank)
         device = torch.device(f'cuda:{local_rank}')
-        # Initialize process group - setting device above should prevent NCCL from guessing
-        dist.init_process_group(backend='nccl', init_method='env://')
+        
+        # Initialize process group - device is already set above
+        dist.init_process_group(
+            backend='nccl', 
+            init_method='env://',
+            world_size=world_size,
+            rank=rank
+        )
+        
         return rank, world_size, device
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -252,7 +216,7 @@ def main(args=None):
         p.add_argument('--save_dir', type=str, default='./checkpoints')
         p.add_argument('--epochs', type=int, default=10)
         p.add_argument('--batch_size', type=int, default=2)
-        p.add_argument('--num_workers', type=int, default=2, help="Number of DataLoader workers (reduce if you see warnings about too many workers)")
+        p.add_argument('--num_workers', type=int, default=1, help="Number of DataLoader workers (reduce if you see warnings about too many workers)")
         p.add_argument('--lr', type=float, default=5e-4)
         p.add_argument('--warmup_steps', type=int, default=4000)
         p.add_argument('--input_dim', type=int, default=80)
@@ -277,6 +241,10 @@ def main(args=None):
         p.add_argument('--use_checkpoint', action='store_true', default=True, help="Use gradient checkpointing to save memory")
         p.add_argument('--no_checkpoint', dest='use_checkpoint', action='store_false', help="Disable gradient checkpointing")
         args = p.parse_args()
+    
+    # Set random seeds for reproducibility
+    torch.manual_seed(42)
+    torch.cuda.manual_seed_all(42)
     
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
@@ -303,14 +271,14 @@ def main(args=None):
         train_pct = int(args.train_data_fraction * 100)
         valid_pct = int(args.valid_data_fraction * 100)
         run_id = f"{socket.gethostname()}-{int(time.time())}"
-        run_name = f"1.58bit-ASR-quantized-{run_id}"
+        run_name = f"1.58bit-ASR-full-precision-{run_id}"
         
         wandb.init(
             project="1.58 bit ASR training",
             name=run_name,
-            group=f"quantized-train{train_pct}pct-valid{valid_pct}pct",
+            group=f"full-precision-train{train_pct}pct-valid{valid_pct}pct",
             config=vars(args),
-            tags=["quantized", "1bit-2bit", "cosine", "adamw", f"train{train_pct}pct", f"valid{valid_pct}pct"],
+            tags=["full-precision", "fp32", "cosine", "adamw", f"train{train_pct}pct", f"valid{valid_pct}pct"],
             resume="allow" if args.resume else None,
         )
 
@@ -325,11 +293,15 @@ def main(args=None):
         sys.stdout = StringIO()
         sys.stderr = StringIO()
     
+    # For DDP, use 0 workers to avoid multiprocessing conflicts
+    # DDP already uses multiple processes, so additional workers can cause segfaults
+    dataloader_num_workers = 0 if use_ddp else args.num_workers
+    
     dm = LibriSpeechDataModule(
-    args.data_dir, 
-    batch_size=args.batch_size, 
-    num_workers=args.num_workers,
-    train_fraction=args.train_data_fraction
+        args.data_dir, 
+        batch_size=args.batch_size, 
+        num_workers=dataloader_num_workers,
+        train_fraction=args.train_data_fraction
     )
     
     if rank != 0:
@@ -344,30 +316,37 @@ def main(args=None):
     # So we need to replace it with a regular DataLoader + DistributedSampler for DDP
     if use_ddp:
         if hasattr(train_dl, '_base'):
-            # Get the underlying dataset (might be a Subset)
-            base_dataset = train_dl._base.dataset
-            # If it's a Subset, we need to use it as-is (DistributedSampler works with Subset)
-            # Set num_workers to 0 for DDP to avoid multiprocessing conflicts that can cause segfaults
-            # DDP already uses multiple processes, so additional workers can cause issues
-            ddp_num_workers = 0
-            train_sampler = DistributedSampler(
-                base_dataset, 
-                num_replicas=world_size, 
-                rank=rank, 
-                shuffle=True,
-                drop_last=False
-            )
-            from torch.utils.data import DataLoader
-            train_dl_new = DataLoader(
-                base_dataset,
-                batch_size=args.batch_size,
-                sampler=train_sampler,  # Use sampler instead of batch_sampler for DDP
-                num_workers=ddp_num_workers,
-                collate_fn=train_dl._base.collate_fn,
-                pin_memory=True,
-            )
-            from onebit_asr.dataloader_stub import _MappedLoader
-            train_dl = _MappedLoader(train_dl_new, token_offset=train_dl._token_offset)
+            try:
+                # Get the underlying dataset (might be a Subset)
+                base_dataset = train_dl._base.dataset
+                # DistributedSampler works with Subset, but we need to be careful
+                # Set num_workers to 0 for DDP to avoid multiprocessing conflicts that can cause segfaults
+                # DDP already uses multiple processes, so additional workers can cause issues
+                ddp_num_workers = 0
+                train_sampler = DistributedSampler(
+                    base_dataset, 
+                    num_replicas=world_size, 
+                    rank=rank, 
+                    shuffle=True,
+                    drop_last=False
+                )
+                from torch.utils.data import DataLoader
+                train_dl_new = DataLoader(
+                    base_dataset,
+                    batch_size=args.batch_size,
+                    sampler=train_sampler,  # Use sampler instead of batch_sampler for DDP
+                    num_workers=ddp_num_workers,
+                    collate_fn=train_dl._base.collate_fn,
+                    pin_memory=False,  # Disable pin_memory to avoid SIGSEGV with SentencePiece/C++ extensions
+                )
+                from onebit_asr.dataloader_stub import _MappedLoader
+                train_dl = _MappedLoader(train_dl_new, token_offset=train_dl._token_offset)
+                # Update the datamodule so subsequent calls return the DDP-compatible loader
+                dm._train_dl = train_dl
+            except Exception as e:
+                if rank == 0:
+                    print(f"Warning: Failed to setup DDP sampler, falling back to original: {e}")
+                # Fall back to original loader
     
     if args.valid_data_fraction < 1.0:
         base_dataloader = valid_dl._base
@@ -386,9 +365,9 @@ def main(args=None):
                 subset_dataset,
                 batch_size=args.batch_size,
                 sampler=subset_sampler,
-                num_workers=args.num_workers,
+                num_workers=0,  # Use 0 workers for DDP to avoid multiprocessing conflicts
                 collate_fn=base_dataloader.collate_fn,
-                pin_memory=True,
+                pin_memory=False,  # Disable pin_memory to avoid SIGSEGV with SentencePiece/C++ extensions
             )
         else:
             subset_dl = DataLoader(
@@ -414,9 +393,9 @@ def main(args=None):
                 valid_dl._base.dataset,
                 batch_size=args.batch_size,
                 sampler=valid_sampler,
-                num_workers=args.num_workers,
+                num_workers=0,  # Use 0 workers for DDP to avoid multiprocessing conflicts
                 collate_fn=valid_dl._base.collate_fn,
-                pin_memory=True,
+                pin_memory=False,  # Disable pin_memory to avoid SIGSEGV with SentencePiece/C++ extensions
             )
             from onebit_asr.dataloader_stub import _MappedLoader
             valid_dl = _MappedLoader(valid_dl_new, token_offset=valid_dl._token_offset)
@@ -444,23 +423,24 @@ def main(args=None):
         use_checkpoint=args.use_checkpoint,
     ).to(device)
     
-    # Synchronize all processes before DDP wrapping to ensure model is initialized on all ranks
+    # Wrap model in DDP - DDP constructor handles synchronization internally
     if use_ddp:
-        dist.barrier()
         local_rank = int(os.environ.get('LOCAL_RANK', 0))
-        # find_unused_parameters=False because we now use all params in forward
-        model = nn.parallel.DistributedDataParallel(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
-        # Synchronize again after DDP wrapping
-        dist.barrier()
+        model = nn.parallel.DistributedDataParallel(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=True)
 
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.98), weight_decay=1e-2)
 
-    final_train_dl = dm.train_dataloader()
+    # Get dataset length safely - use the train_dl we already have
     try:
-        base_ds = final_train_dl._base.dataset if hasattr(final_train_dl, "_base") else final_train_dl.dataset
-        dataset_len = len(base_ds)
-    except Exception:
-        dataset_len = len(final_train_dl)
+        if hasattr(train_dl, "_base") and hasattr(train_dl._base, "dataset"):
+            base_ds = train_dl._base.dataset
+            dataset_len = len(base_ds)
+        else:
+            dataset_len = len(train_dl)
+    except Exception as e:
+        if rank == 0:
+            print(f"Warning: Could not get dataset length: {e}")
+        dataset_len = len(train_dl) if hasattr(train_dl, "__len__") else 1000  # fallback
     
     if rank == 0:
         print(f"Final train dataset size used = {dataset_len} samples")
@@ -474,7 +454,7 @@ def main(args=None):
         run_id = f"{socket.gethostname()}-{int(time.time())}"
         train_pct = int(args.train_data_fraction * 100)
         valid_pct = int(args.valid_data_fraction * 100)
-        run_name = (wandb.run.name or f"quantized-train{train_pct}pct-valid{valid_pct}pct-{run_id}") if wandb.run is not None else f"quantized-train{train_pct}pct-valid{valid_pct}pct-{run_id}"
+        run_name = (wandb.run.name or f"full-precision-train{train_pct}pct-valid{valid_pct}pct-{run_id}") if wandb.run is not None else f"full-precision-train{train_pct}pct-valid{valid_pct}pct-{run_id}"
         run_dir = os.path.join(args.save_dir, run_name)
         os.makedirs(run_dir, exist_ok=True)
         
@@ -502,7 +482,7 @@ def main(args=None):
         sp.load(os.path.join('src', 'data', 'tokenizer.model'))
     
     if use_ddp:
-        dist.barrier()
+        dist.barrier()  # Synchronize after SentencePiece loading
 
     try:
         for epoch in range(1, args.epochs+1):
@@ -523,7 +503,7 @@ def main(args=None):
                 break
             
             if use_ddp:
-                dist.barrier()
+                dist.barrier()  # Synchronize after training epoch
             
             va, val_wer_student, val_wer_teacher, val_wer_fp32 = run_epoch(model, dm, optimizer, sched=None, device=device, args=args, train=False,
                                     lambda1=args.lambda1, lambda2=args.lambda2, gamma_ctc=args.gamma_ctc,
@@ -560,19 +540,35 @@ def main(args=None):
         if rank == 0:
             print("\nKeyboard interrupt received, saving checkpoint and exiting...")
     finally:
-        if rank == 0 and not _shutdown_flag:
-            model_state = model.module.state_dict() if use_ddp else model.state_dict()
-            ckpt = {
-                'epoch': epoch,
-                'model': model_state,
-                'optimizer': optimizer.state_dict(),
-                'args': vars(args),
-                'val_loss': va if 'va' in locals() else best_val,
-            }
-            torch.save(ckpt, os.path.join(run_dir, f'ckpt_last.pt'))
-            print("Final checkpoint saved.")
+        # Synchronize all processes before cleanup
+        if use_ddp:
+            try:
+                dist.barrier()  # Synchronize before cleanup
+            except Exception as e:
+                if rank == 0:
+                    print(f"Warning: Barrier failed during cleanup: {e}")
         
-        cleanup()
+        if rank == 0 and not _shutdown_flag:
+            try:
+                model_state = model.module.state_dict() if use_ddp else model.state_dict()
+                ckpt = {
+                    'epoch': epoch if 'epoch' in locals() else 0,
+                    'model': model_state,
+                    'optimizer': optimizer.state_dict(),
+                    'args': vars(args),
+                    'val_loss': va if 'va' in locals() else best_val,
+                }
+                torch.save(ckpt, os.path.join(run_dir, f'ckpt_last.pt'))
+                print("Final checkpoint saved.")
+            except Exception as e:
+                print(f"Error saving final checkpoint: {e}")
+        
+        # Cleanup with error handling
+        try:
+            cleanup()
+        except Exception as e:
+            if rank == 0:
+                print(f"Warning: Cleanup error (non-fatal): {e}")
 
 
 if __name__ == '__main__':

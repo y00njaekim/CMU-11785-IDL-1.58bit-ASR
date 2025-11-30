@@ -16,6 +16,6 @@ source .venv/bin/activate
 torchrun --nproc_per_node=2 -m onebit_asr.train_full_precision \
     --data_dir data \
     --epochs 50 \
-    --train_data_fraction 0.1 \
+    --train_data_fraction 1.0 \
     --batch_size 8 \
     --ddp

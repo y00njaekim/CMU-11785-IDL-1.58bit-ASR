@@ -271,10 +271,10 @@ def main(args=None):
         train_pct = int(args.train_data_fraction * 100)
         valid_pct = int(args.valid_data_fraction * 100)
         run_id = f"{socket.gethostname()}-{int(time.time())}"
-        run_name = f"full-precision-train{train_pct}pct-valid{valid_pct}pct-{run_id}"
+        run_name = f"1.58bit-ASR-full-precision-{run_id}"
         
         wandb.init(
-            project="ASR-1bit",
+            project="1.58 bit ASR training",
             name=run_name,
             group=f"full-precision-train{train_pct}pct-valid{valid_pct}pct",
             config=vars(args),

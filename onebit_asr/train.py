@@ -325,10 +325,14 @@ def main(args=None):
         sys.stdout = StringIO()
         sys.stderr = StringIO()
     
+    # For DDP, use 0 workers to avoid multiprocessing conflicts
+    # DDP already uses multiple processes, so additional workers can cause segfaults
+    dataloader_num_workers = 0 if use_ddp else args.num_workers
+    
     dm = LibriSpeechDataModule(
     args.data_dir, 
     batch_size=args.batch_size, 
-    num_workers=args.num_workers,
+    num_workers=dataloader_num_workers,
     train_fraction=args.train_data_fraction
     )
     
@@ -364,7 +368,7 @@ def main(args=None):
                 sampler=train_sampler,  # Use sampler instead of batch_sampler for DDP
                 num_workers=ddp_num_workers,
                 collate_fn=train_dl._base.collate_fn,
-                pin_memory=True,
+                pin_memory=False,  # Disable pin_memory to avoid SIGSEGV with SentencePiece/C++ extensions
             )
             from onebit_asr.dataloader_stub import _MappedLoader
             train_dl = _MappedLoader(train_dl_new, token_offset=train_dl._token_offset)
@@ -386,9 +390,9 @@ def main(args=None):
                 subset_dataset,
                 batch_size=args.batch_size,
                 sampler=subset_sampler,
-                num_workers=args.num_workers,
+                num_workers=0,  # Use 0 workers for DDP to avoid multiprocessing conflicts
                 collate_fn=base_dataloader.collate_fn,
-                pin_memory=True,
+                pin_memory=False,  # Disable pin_memory to avoid SIGSEGV with SentencePiece/C++ extensions
             )
         else:
             subset_dl = DataLoader(
@@ -414,9 +418,9 @@ def main(args=None):
                 valid_dl._base.dataset,
                 batch_size=args.batch_size,
                 sampler=valid_sampler,
-                num_workers=args.num_workers,
+                num_workers=0,  # Use 0 workers for DDP to avoid multiprocessing conflicts
                 collate_fn=valid_dl._base.collate_fn,
-                pin_memory=True,
+                pin_memory=False,  # Disable pin_memory to avoid SIGSEGV with SentencePiece/C++ extensions
             )
             from onebit_asr.dataloader_stub import _MappedLoader
             valid_dl = _MappedLoader(valid_dl_new, token_offset=valid_dl._token_offset)
@@ -444,14 +448,11 @@ def main(args=None):
         use_checkpoint=args.use_checkpoint,
     ).to(device)
     
-    # Synchronize all processes before DDP wrapping to ensure model is initialized on all ranks
+    # Wrap model in DDP - DDP constructor handles synchronization internally
     if use_ddp:
-        dist.barrier()
         local_rank = int(os.environ.get('LOCAL_RANK', 0))
         # find_unused_parameters=False because we now use all params in forward
         model = nn.parallel.DistributedDataParallel(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
-        # Synchronize again after DDP wrapping
-        dist.barrier()
 
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.98), weight_decay=1e-2)
 
